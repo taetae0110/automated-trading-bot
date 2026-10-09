@@ -68,6 +68,8 @@ FEE = 0.0005
 SLIP = 0.0005
 MAX_POSITION_PCT = 0.2
 STOP_LOSS_PCT = 0.03
+# 일일 손실 한도 테스트용 (0.01%). 수수료+슬리피지만으로도 왕복 손실이 이 비율을 넘는다 (아래 losing_same_day_k 참고)
+DAILY_LOSS_LIMIT = 0.0001
 H = 3600
 D = 86400
 
@@ -299,6 +301,29 @@ class StuckBroker(PaperBroker):
         return True
 
 
+class SellStuckBroker(StuckBroker):
+    """매수는 PaperBroker 로 정상 체결하고 **매도만** OPEN 상태로 머무는 브로커 (매도 타임아웃 경로 테스트용).
+
+    매도 주문의 결말은 ``on_cancel`` (cancel | filled | partial) 로 정한다. 매도가 PaperBroker 계좌를 건드리지
+    않으므로 거래소(모의계좌) 보유 수량은 매수 수량 그대로다.
+    """
+
+    def place_order(self, symbol, side, quantity, order_type=OrderType.MARKET, price=None, **kw):
+        if OrderSide(side) == OrderSide.BUY:
+            return PaperBroker.place_order(self, symbol, side, quantity, order_type, price, **kw)
+        return super().place_order(symbol, side, quantity, order_type, price, **kw)
+
+    def get_order(self, order_id, symbol=None):
+        if order_id in self.stuck:
+            return super().get_order(order_id, symbol)
+        return PaperBroker.get_order(self, order_id, symbol)
+
+    def cancel_order(self, order_id, symbol=None):
+        if order_id in self.stuck:
+            return super().cancel_order(order_id, symbol)
+        return PaperBroker.cancel_order(self, order_id, symbol)
+
+
 class ExchangeLike(BaseBroker):
     """실거래 어댑터처럼 보이는 래퍼. 시세/주문/계좌는 안의 PaperBroker 에 위임하되,
 
@@ -513,6 +538,46 @@ def breakout_days(daily: list[Candle], k: float = 0.5) -> tuple[list[int], list[
     return hits, misses
 
 
+def losing_same_day_k(candles: list[Candle], start: int = 40) -> int:
+    """같은 UTC 날짜 안에서 "k 완성 직후 BUY → k+1 완성 직후 저가에 SELL → k+2 완성 직후 BUY" 를 넣을 수 있는
+    실제 캔들 인덱스 (k+1 ~ k+3 캔들이 같은 날). 매도가(k+2 저가 × (1-슬리피지)) 가 매수가(k+1 종가 × (1+슬리피지))
+    보다 낮아 첫 거래가 수수료 이전에도 손실이다. 없으면 skip."""
+    for k in range(start, len(candles) - 4):
+        same_day = candles[k + 1].timestamp.date() == candles[k + 3].timestamp.date()
+        entry = candles[k + 1].close * (1 + SLIP)
+        exit_ = candles[k + 2].low * (1 - SLIP)
+        if same_day and exit_ < entry:
+            return k
+    pytest.skip("같은 UTC 날짜에 손실 왕복 매매를 넣을 실제 캔들이 없음")
+
+
+def run_losing_round_trip(tmp_path: Path, candles: list[Candle], k: int, strat: ScriptedStrategy) -> Harness:
+    """``DAILY_LOSS_LIMIT`` 로 엔진을 만들고 캔들 k 에 BUY, k+1 에 SELL(진행중 캔들 저가) 을 돌려 한도를 넘긴다."""
+    strat.at(BTC, candles[k].timestamp, SignalAction.BUY)
+    strat.at(BTC, candles[k + 1].timestamp, SignalAction.SELL, reason="손실 청산")
+    clock = FakeClock(after_candle(candles, k))
+    h = build(
+        tmp_path,
+        {BTC: candles},
+        clock,
+        strategy=strat,
+        overrides={"risk": {"max_daily_loss_pct": DAILY_LOSS_LIMIT}},
+    )
+    h.trader.run_once()  # BUY
+    assert BTC in h.trader.positions
+    h.feed.ticker_field = "low"  # 다음 폴링 현재가 = 진행중 실제 캔들의 저가 → 손실 청산
+    clock.advance(H)
+    h.trader.run_once()  # SELL
+    h.feed.ticker_field = "close"
+    assert BTC not in h.trader.positions and len(h.trader.trades) == 1
+    t = h.trader.trades[0]
+    start = h.trader.risk.day_start_equity
+    assert t.pnl < 0 and start == approx(INITIAL_CASH)
+    assert t.pnl / start <= -DAILY_LOSS_LIMIT  # 실제 손실이 한도를 넘는다 (데이터 전제 자체 검증)
+    assert h.trader.risk.daily_loss_limit_hit()
+    return h
+
+
 @pytest.fixture
 def eth_daily(eth_daily_df) -> list[Candle]:
     return df_to_candles(eth_daily_df)
@@ -694,23 +759,100 @@ class TestEntry:
         assert any("주문 수량 0" in r.message for r in caplog.records)
         assert h.trader.cycle_errors == 0
 
-    def test_limit_signal_places_limit_order_and_cancels_on_timeout(self, tmp_path, candles):
+    def test_limit_signal_below_market_stays_unfilled_and_cancels_on_timeout(self, tmp_path, candles):
+        """현재가(진행중 실제 캔들 종가)보다 1% 낮은 지정가 매수는 체결 조건이 안 되므로 OPEN 으로 남고,
+        ``fill_timeout_sec`` 뒤 취소된다 (음성 사례)."""
         clock = FakeClock(after_candle(candles, self.K))
         strat = ScriptedStrategy()
-        limit_price = candles[self.K + 1].low  # 실제 캔들 저가
+        market = candles[self.K + 1].close
+        limit_price = market * 0.99  # 현재가 아래 → 미체결
         strat.at(
             BTC, candles[self.K].timestamp, SignalAction.BUY, order_type=OrderType.LIMIT, price=limit_price
         )
         h = build(tmp_path, {BTC: candles}, clock, strategy=strat)
+        assert h.broker.get_ticker(BTC) == market > limit_price  # 전제: 지정가 < 현재가
         h.trader.run_once()
         orders = h.broker.orders
         assert len(orders) == 1
         assert orders[0].type == OrderType.LIMIT and orders[0].price == approx(limit_price)
-        assert orders[0].status == OrderStatus.CANCELED
+        assert orders[0].status == OrderStatus.CANCELED and orders[0].filled_quantity == 0.0
         assert orders[0].quantity == approx(expected_qty(limit_price))
         assert sum(h.sleeps) == approx(h.config.broker.fill_timeout_sec)
-        assert h.trader.positions == {}
-        assert h.notifier.find("매수 미체결")
+        assert h.trader.positions == {} and h.broker.get_positions() == {}
+        assert h.broker.cash == INITIAL_CASH
+        assert h.notifier.find("매수 미체결") and h.notifier.find("[체결]") == []
+
+    def test_limit_signal_above_market_fills_in_paper_mode(self, tmp_path, candles):
+        """현재가보다 높은 지정가 매수(marketable limit)는 모의투자에서도 체결돼야 한다 — 엔진이 체결 대기 중
+        ``PaperBroker.check_pending`` 을 돌리지 않으면 LIMIT 은 영원히 OPEN 이라 항상 타임아웃 취소됐다."""
+        clock = FakeClock(after_candle(candles, self.K))
+        strat = ScriptedStrategy()
+        market = candles[self.K + 1].close  # 진행중 실제 캔들의 현재가
+        limit_price = market * 1.01
+        strat.at(
+            BTC,
+            candles[self.K].timestamp,
+            SignalAction.BUY,
+            order_type=OrderType.LIMIT,
+            price=limit_price,
+            reason="지정가 매수",
+        )
+        h = build(tmp_path, {BTC: candles}, clock, strategy=strat)
+        h.trader.run_once()
+
+        orders = h.broker.orders
+        assert len(orders) == 1
+        order = orders[0]
+        assert order.type == OrderType.LIMIT and order.price == approx(limit_price)
+        assert order.status == OrderStatus.FILLED
+        # paper.py check_pending: 현재가가 지정가를 지나쳤으면 **현재가** 에, 슬리피지 없이 체결 (지정가보다 유리)
+        assert order.average_price == approx(market) and order.average_price <= limit_price
+        assert order.raw["fill_basis"] == "market"
+        qty = expected_qty(limit_price)  # 사이징은 지정가 기준
+        assert order.filled_quantity == approx(qty) and order.fee == approx(market * qty * FEE)
+
+        pos = h.trader.positions[BTC]
+        assert pos.quantity == approx(qty) and pos.average_price == approx(market)
+        assert pos.stop_loss == approx(market * (1 - STOP_LOSS_PCT))
+        assert pos.opened_at == clock.now  # 체결 시각 = 1회 폴링 대기 후
+        assert pos.meta["entry_order_id"] == order.id and pos.meta["entry_fee"] == approx(order.fee)
+        assert pos.meta["entry_bar_ts"] == candles[self.K].timestamp.isoformat()
+        assert h.broker.get_positions()[BTC].quantity == approx(qty)
+        assert h.broker.cash == approx(INITIAL_CASH - market * qty * (1 + FEE))
+        assert 0 < sum(h.sleeps) < h.config.broker.fill_timeout_sec  # 타임아웃 전에 체결
+        assert h.trader.cycle_errors == 0 and h.trader.inflight_entries == {}
+        msgs = h.notifier.find("[체결]")
+        assert len(msgs) == 1 and "매수" in msgs[0] and "지정가 매수" in msgs[0]
+        assert h.notifier.find("미체결") == []
+        data = json.loads(h.store.path.read_text())
+        assert data["positions"][BTC]["quantity"] == approx(qty)
+        assert data["paper_broker"]["orders"][0]["status"] == "filled"
+
+    def test_daily_loss_limit_blocks_reentry_same_day(self, tmp_path, candles, caplog):
+        """손실 청산 → 같은 UTC 날짜의 다음 BUY 신호는 ``risk.can_open`` 의 일일 손실 한도에 막힌다 (엔진 경유)."""
+        k = losing_same_day_k(candles)
+        strat = ScriptedStrategy()
+        strat.at(BTC, candles[k + 2].timestamp, SignalAction.BUY, reason="재진입 시도")
+        h = run_losing_round_trip(tmp_path, candles, k, strat)
+        t = h.trader.trades[0]
+        day = h.clock.now.date()
+        start = h.trader.risk.day_start_equity
+
+        h.clock.advance(H)
+        assert h.clock.now.date() == day  # 같은 날
+        with caplog.at_level(logging.INFO):
+            h.trader.run_once()  # BUY 신호 → 거부
+        assert h.strategy.calls[-1] == (BTC, candles[k + 2].timestamp)  # 신호는 평가됐지만
+        assert h.trader.positions == {} and h.trader.inflight_entries == {}
+        assert len(h.broker.orders) == 2  # 매수 1 + 매도 1, 세 번째 주문 없음
+        rejected = [r.message for r in caplog.records if "진입 거부" in r.message]
+        assert len(rejected) == 1 and "일일 손실 한도" in rejected[0]
+        assert h.trader.cycle_errors == 0
+        assert h.trader.risk.daily_trades == 1 and h.trader.risk.daily_pnl == approx(t.pnl)
+        data = json.loads(h.store.path.read_text())
+        assert data["risk"]["daily_pnl"] == approx(t.pnl)
+        assert data["risk"]["day"] == day.isoformat() and data["risk"]["day_start_equity"] == approx(start)
+        assert data["last_candle_ts"][BTC] == candles[k + 2].timestamp.isoformat()
 
     def test_notify_on_signal(self, tmp_path, candles):
         clock = FakeClock(after_candle(candles, self.K))
@@ -1175,6 +1317,69 @@ class TestBreakout:
         assert "최대 보유 기간 만료 (1/1봉)" in t.reason and t.quantity == approx(qty)
         assert t.exit_price == approx(daily_candles[i + 1].open * (1 - SLIP))
 
+    def test_trigger_order_error_consumes_pending_without_retry(self, tmp_path, daily_candles):
+        """트리거 폴링의 매수 주문이 OrderError 로 실패하면 대기 주문은 소비되고(1회 시도), 현재가가 트리거 위에
+        머물러도 같은 날 다시 주문하지 않는다 (실거래 중복 주문 방지). 다음 날 새 캔들에서야 새 대기 주문이 등록된다."""
+
+        class RejectingBroker(PaperBroker):
+            def __init__(self, *args: Any, **kw: Any) -> None:
+                super().__init__(*args, **kw)
+                self.place_calls = 0
+
+            def place_order(self, *a, **kw):
+                self.place_calls += 1
+                raise OrderError("주문 거부 (테스트)")
+
+        hits, _ = breakout_days(daily_candles)
+        if not hits:
+            pytest.skip("실제 데이터에 돌파 일이 없음")
+        i = hits[0]
+        clock = FakeClock(after_candle(daily_candles, i - 1, D))
+        feed = RealCandleFeed({BTC: daily_candles}, clock, "1d")
+        feed.ticker_field = "open"
+        broker = RejectingBroker(initial_cash=INITIAL_CASH, fee_pct=FEE, slippage_pct=SLIP, data_source=feed)
+        h = build(
+            tmp_path,
+            {BTC: daily_candles},
+            clock,
+            interval="1d",
+            strategy=VolatilityBreakoutStrategy(k=0.5),
+            broker=broker,
+            feed=feed,
+        )
+        h.trader.run_once()
+        trigger = h.trader.pending_breakouts[BTC].trigger
+        assert daily_candles[i].high >= trigger
+
+        feed.ticker_field = "high"  # 장중 고가 도달 → 트리거
+        clock.advance(H)
+        h.trader.run_once()  # 주문 전송 → OrderError
+        assert broker.place_calls == 1
+        assert h.trader.cycle_errors == 1
+        assert (
+            h.trader.pending_breakouts == {} and h.trader.positions == {} and h.trader.inflight_entries == {}
+        )
+        errs = h.notifier.find("[오류]")
+        assert len(errs) == 1 and "OrderError" in errs[0] and "주문 거부" in errs[0]
+        assert json.loads(h.store.path.read_text())["pending_breakouts"] == {}
+
+        clock.advance(600)  # 같은 날 다음 폴링, 현재가는 여전히 트리거 위
+        h.trader.run_once()
+        assert feed.get_ticker(BTC) >= trigger
+        assert broker.place_calls == 1  # 재주문 없음
+        assert h.trader.positions == {} and h.trader.pending_breakouts == {}
+        assert h.trader.cycle_errors == 0 and len(h.notifier.find("[오류]")) == 1
+
+        feed.ticker_field = "open"
+        clock.set(after_candle(daily_candles, i, D))  # 다음 날 새 캔들
+        h.trader.run_once()
+        pb = h.trader.pending_breakouts[BTC]
+        assert pb.candle_ts == daily_candles[i].timestamp
+        assert pb.trigger == approx(
+            daily_candles[i + 1].open + 0.5 * (daily_candles[i].high - daily_candles[i].low)
+        )
+        assert broker.place_calls == 1 and h.trader.positions == {}
+
 
 # ============================================================================ 시작 시 포지션 동기화
 class TestSyncPositions:
@@ -1398,6 +1603,108 @@ class TestFillTimeout:
         assert BTC in h.trader.positions
         assert broker.cancel_calls == []
         assert sum("상태 조회 실패" in r.message for r in caplog.records) == 2
+
+    # ------------------------------------------------------------ 매도(청산) 주문의 타임아웃
+    def _sell_stuck(
+        self, tmp_path, candles, on_cancel: str
+    ) -> tuple[Harness, SellStuckBroker, Position, Position]:
+        """K 캔들 BUY(정상 체결) → K+1 캔들 SELL 신호가 OPEN 으로 머물러 타임아웃 → ``on_cancel`` 결말.
+
+        (harness, broker, 엔진 포지션 객체, 매도 전 포지션 스냅샷) 을 돌려준다.
+        """
+        clock = FakeClock(after_candle(candles, self.K))
+        feed = RealCandleFeed({BTC: candles}, clock, "1h")
+        broker = SellStuckBroker(
+            initial_cash=INITIAL_CASH, fee_pct=FEE, slippage_pct=SLIP, data_source=feed, on_cancel=on_cancel
+        )
+        strat = ScriptedStrategy()
+        strat.at(BTC, candles[self.K].timestamp, SignalAction.BUY)
+        strat.at(BTC, candles[self.K + 1].timestamp, SignalAction.SELL, reason="테스트 매도")
+        h = build(
+            tmp_path,
+            {BTC: candles},
+            clock,
+            strategy=strat,
+            broker=broker,
+            feed=feed,
+            overrides={"broker": {"fill_timeout_sec": self.TIMEOUT}},
+        )
+        h.trader.run_once()
+        pos = h.trader.positions[BTC]
+        before = dataclasses.replace(pos, meta=dict(pos.meta))
+        assert broker.stuck == {} and len(broker.orders) == 1 and h.sleeps == []  # 매수는 정상 체결
+        clock.advance(H)
+        h.trader.run_once()  # SELL → OPEN → 타임아웃 → 취소
+        assert broker.cancel_calls == ["stuck-1"]
+        assert sum(h.sleeps) == approx(self.TIMEOUT)
+        return h, broker, pos, before
+
+    def test_sell_timeout_cancel_keeps_position_and_records_nothing(self, tmp_path, candles, caplog):
+        with caplog.at_level(logging.WARNING):
+            h, broker, pos, before = self._sell_stuck(tmp_path, candles, "cancel")
+        assert broker.stuck["stuck-1"].status == OrderStatus.CANCELED
+        assert h.trader.positions[BTC] is pos
+        assert pos.quantity == approx(before.quantity) and pos.average_price == approx(before.average_price)
+        assert pos.meta["entry_fee"] == approx(before.meta["entry_fee"])
+        assert "exit_type" not in pos.meta  # 청산되지 않은 포지션에 청산 사유를 남기지 않는다
+        assert h.trader.trades == [] and h.broker.trades == []
+        assert h.trader.risk.daily_trades == 0 and h.trader.risk.daily_pnl == 0.0
+        assert h.broker.get_positions()[BTC].quantity == approx(before.quantity)
+        assert len(h.notifier.find("매도 미체결")) == 1
+        assert [m for m in h.notifier.find("[체결]") if "매도" in m] == []
+        assert any("체결되지 않아 취소" in r.message for r in caplog.records)
+        assert h.trader.cycle_errors == 0
+        data = json.loads(h.store.path.read_text())
+        assert data["positions"][BTC]["quantity"] == approx(before.quantity) and data["trades"] == []
+        assert "exit_type" not in data["positions"][BTC]["meta"]
+
+    def test_sell_partial_fill_at_timeout_records_partial_trade_and_keeps_rest(
+        self, tmp_path, candles, caplog
+    ):
+        with caplog.at_level(logging.WARNING):
+            h, broker, pos, before = self._sell_stuck(tmp_path, candles, "partial")
+        stuck = broker.stuck["stuck-1"]
+        assert stuck.status == OrderStatus.CANCELED and stuck.filled_quantity == approx(before.quantity / 2)
+        exit_price = candles[self.K + 2].close  # 취소 시점 현재가 (StuckBroker 는 슬리피지/수수료 없음)
+        assert len(h.trader.trades) == 1
+        t = h.trader.trades[0]
+        assert t.quantity == approx(before.quantity / 2)
+        assert t.entry_price == approx(before.average_price) and t.exit_price == approx(exit_price)
+        assert t.fee == approx(before.meta["entry_fee"] / 2)  # 매수 수수료 비례 배분 + 매도 수수료 0
+        assert t.reason == "테스트 매도" and t.exit_time == stuck.updated_at
+        assert t.pnl == approx((exit_price - before.average_price) * before.quantity / 2 - t.fee)
+        # 잔여 절반은 포지션으로 유지
+        assert h.trader.positions[BTC] is pos
+        assert pos.quantity == approx(before.quantity / 2)
+        assert pos.meta["entry_fee"] == approx(before.meta["entry_fee"] / 2)
+        assert "exit_type" not in pos.meta  # 아직 보유 중 → 청산 사유 없음
+        assert h.trader.risk.daily_trades == 1 and h.trader.risk.daily_pnl == approx(t.pnl)
+        assert any("부분 체결" in r.message for r in caplog.records)
+        assert h.notifier.find("매도 미체결") == []
+        fills = [m for m in h.notifier.find("[체결]") if "매도" in m]
+        assert len(fills) == 1 and "손익" in fills[0]
+        data = json.loads(h.store.path.read_text())
+        assert data["positions"][BTC]["quantity"] == approx(before.quantity / 2)
+        assert len(data["trades"]) == 1 and data["trades"][0]["quantity"] == approx(before.quantity / 2)
+        assert "exit_type" not in data["positions"][BTC]["meta"]
+
+    def test_sell_filled_while_canceling_closes_position(self, tmp_path, candles):
+        h, broker, pos, before = self._sell_stuck(tmp_path, candles, "filled")
+        stuck = broker.stuck["stuck-1"]
+        assert stuck.status == OrderStatus.FILLED and stuck.filled_quantity == approx(before.quantity)
+        exit_price = candles[self.K + 2].close
+        assert BTC not in h.trader.positions
+        assert len(h.trader.trades) == 1
+        t = h.trader.trades[0]
+        assert t.quantity == approx(before.quantity) and t.exit_price == approx(exit_price)
+        assert t.entry_price == approx(before.average_price) and t.entry_time == before.opened_at
+        assert t.fee == approx(before.meta["entry_fee"]) and t.exit_time == stuck.updated_at
+        assert pos.meta["exit_type"] == EXIT_SIGNAL
+        assert h.trader.risk.daily_trades == 1 and h.trader.risk.daily_pnl == approx(t.pnl)
+        assert h.notifier.find("매도 미체결") == []
+        assert [m for m in h.notifier.find("[체결]") if "매도" in m]
+        data = json.loads(h.store.path.read_text())
+        assert data["positions"] == {} and len(data["trades"]) == 1
 
 
 # ============================================================================ 주문 안전 장치 (전송 후 오류/크래시)
@@ -1910,6 +2217,50 @@ class TestRestore:
         h2.trader.start()
         assert BTC in h2.trader.positions and h2.notifier.find("[경고]") == []
         assert [p.name for p in tmp_path.iterdir() if p.name.startswith("state.json.")] == []
+
+    def test_daily_loss_limit_survives_restart_same_day(self, tmp_path, candles, caplog):
+        """한도에 걸린 날 재시작: 저장된 risk 상태(당일 손익/시작 자산)가 복원돼 같은 날 BUY 는 계속 거부된다.
+        당일 시작 자산은 손실이 반영된 현재 자산이 아니라 저장값이어야 한다 (아니면 한도가 리셋된다)."""
+        k = losing_same_day_k(candles)
+        h1 = run_losing_round_trip(tmp_path, candles, k, ScriptedStrategy())
+        t = h1.trader.trades[0]
+        saved = json.loads(h1.store.path.read_text())["risk"]
+        assert saved["daily_pnl"] == approx(t.pnl) and saved["day_start_equity"] == approx(INITIAL_CASH)
+        assert saved["day"] == h1.clock.now.date().isoformat()
+
+        h1.clock.advance(
+            H
+        )  # 같은 날 다음 캔들에서 재시작 (_buy_then_restart 와 같은 방식: 같은 상태 파일/시계)
+        day = h1.clock.now.date()
+        assert day.isoformat() == saved["day"]
+        strat2 = ScriptedStrategy()
+        strat2.at(BTC, candles[k + 2].timestamp, SignalAction.BUY, reason="재시작 후 재진입 시도")
+        h2 = build(
+            tmp_path,
+            {BTC: candles},
+            h1.clock,
+            strategy=strat2,
+            overrides={"risk": {"max_daily_loss_pct": DAILY_LOSS_LIMIT}},
+        )
+        h2.trader.start()
+        risk = h2.trader.risk
+        assert risk.current_day == day
+        assert risk.day_start_equity == approx(saved["day_start_equity"])
+        assert h2.broker.get_equity() < risk.day_start_equity  # 손실 반영된 현재 자산으로 덮지 않았다
+        assert risk.daily_pnl == approx(t.pnl) and risk.daily_trades == 1
+        assert risk.daily_loss_limit_hit()
+        assert h2.trader.trades[0].pnl == approx(t.pnl)
+
+        with caplog.at_level(logging.INFO):
+            h2.trader.run_once()  # 새 캔들 k+2 의 BUY → 거부
+        assert h2.strategy.calls == [(BTC, candles[k + 2].timestamp)]
+        assert h2.trader.positions == {} and h2.trader.inflight_entries == {}
+        assert len(h2.broker.orders) == 2  # 복원된 매수/매도 2건 뿐, 새 주문 없음
+        rejected = [r.message for r in caplog.records if "진입 거부" in r.message]
+        assert len(rejected) == 1 and "일일 손실 한도" in rejected[0]
+        data = json.loads(h2.store.path.read_text())
+        assert data["risk"]["day_start_equity"] == approx(saved["day_start_equity"])
+        assert data["risk"]["daily_pnl"] == approx(t.pnl)
 
 
 # ============================================================================ run_forever / stop / 시그널 / 백오프

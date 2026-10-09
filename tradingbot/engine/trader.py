@@ -37,6 +37,8 @@
 - 당일 시작 자산 기록(``risk.start_day``)이 실패하면 기록될 때까지 매 폴링 다시 시도한다 (일일 손실 한도 유지).
 - 비밀값(키/토큰/웹훅 URL)은 로그/알림에 남기지 않는다 (``mask_secrets``).
 - 데모/샘플 시세는 없다. 모든 가격은 브로커(실거래 API 또는 PaperBroker 의 data_source)에서 온다.
+- 모의투자(PaperBroker)의 LIMIT/STOP 주문은 거래소가 체결해 주지 않으므로 체결 대기 폴링마다
+  ``check_pending`` 으로 현재가 기준 체결 판정을 돌린다 (``_simulate_paper_fill``, ARCHITECTURE §3).
 """
 
 from __future__ import annotations
@@ -1388,12 +1390,14 @@ class Trader:
 
         remaining = pos.quantity - filled_qty
         if remaining <= _tol(pos.quantity):
+            # exit_type 은 포지션이 완전히 닫혔을 때만 기록한다 — 부분 체결로 아직 보유 중인 포지션에 남기면
+            # 상태 파일/대시보드가 "청산된 포지션" 으로 오해한다
+            pos.meta["exit_type"] = exit_type
             self._positions.pop(sym, None)
         else:
             pos.quantity = remaining
             pos.meta["entry_fee"] = entry_fee * (1.0 - ratio)
             logger.warning("%s 부분 체결: 잔여 %s 는 포지션으로 유지합니다", sym, _fmt_qty(remaining))
-        pos.meta["exit_type"] = exit_type
         self._save_state()  # 청산 즉시 저장
         self._notify_fill(sym, OrderSide.SELL, filled_qty, exit_price, order, reason, trade=trade)
 
@@ -1414,7 +1418,13 @@ class Trader:
 
     # ------------------------------------------------------------------ 체결 확인
     def _await_fill(self, order: Order, sym: str) -> Order:
-        """terminal 상태가 될 때까지 ``get_order`` 폴링. ``fill_timeout_sec`` 초과 시 취소 후 최종 상태 반환."""
+        """terminal 상태가 될 때까지 ``get_order`` 폴링. ``fill_timeout_sec`` 초과 시 취소 후 최종 상태 반환.
+
+        모의투자(PaperBroker)는 거래소 체결 엔진이 없으므로 매 ``get_order`` 폴링 직전에 ``_simulate_paper_fill`` 로
+        현재가 기준 체결 판정(``check_pending``)을 돌린다 — 이게 없으면 시장가보다 유리한 LIMIT 매수도 영원히 OPEN 이라
+        타임아웃 취소된다. 매수(``_enter``)/매도(``_exit``) 모두 이 함수를 타므로 비시장가 청산 주문이 생겨도 같은 훅이
+        적용된다.
+        """
         if order.status.is_terminal:
             return order
         timeout = max(float(self.config.broker.fill_timeout_sec), 0.0)
@@ -1428,6 +1438,7 @@ class Trader:
                 break
             self._sleep(poll)
             polls += 1
+            self._simulate_paper_fill(sym, order)
             try:
                 order = self.broker.get_order(order.id, sym)
             except BrokerError as e:
@@ -1469,6 +1480,31 @@ class Trader:
             if self.config.notify.notify_on_error:
                 self._notify_error(f"[오류] {msg}", self._now())
         return order
+
+    def _simulate_paper_fill(self, sym: str, order: Order) -> None:
+        """모의투자 체결 훅 (ARCHITECTURE §3 ``PaperBroker.check_pending`` — 모의투자 폴링용 체결 판정).
+
+        PaperBroker 는 LIMIT/STOP 주문을 OPEN 으로 보관만 하므로 엔진이 현재가로 체결 판정을 돌려 줘야 한다.
+        실거래 브로커는 거래소가 체결하므로 아무것도 하지 않는다. 시세 조회/판정 실패는 ``get_order`` 조회 실패와
+        같이 경고만 남기고 다음 폴링에 다시 시도한다 (예외를 밖으로 던지지 않는다).
+        """
+        if not isinstance(self.broker, PaperBroker):
+            return
+        try:
+            price = float(self.broker.get_ticker(sym))
+            filled = self.broker.check_pending(sym, price)
+        except (BrokerError, DataError) as e:
+            logger.warning("%s 주문 %s 모의 체결 판정 실패: %s", sym, order.id, mask_secrets(str(e)))
+            return
+        for f in filled:
+            logger.info(
+                "%s 주문 %s 모의 체결: 현재가 %s → 체결가 %s (%s)",
+                sym,
+                f.id,
+                _fmt(price),
+                _fmt(f.average_price),
+                f.raw.get("fill_basis", "-"),
+            )
 
     @staticmethod
     def _fill_result(order: Order, fallback_price: float) -> tuple[float, float]:
