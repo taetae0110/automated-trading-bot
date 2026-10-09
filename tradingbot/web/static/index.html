@@ -3,11 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'">
+  <meta name="referrer" content="no-referrer">
   <meta name="color-scheme" content="light dark">
   <meta name="description" content="tradingbot 자동매매 봇 상태·백테스트·거래내역을 보는 로컬 대시보드">
   <title>트레이딩 대시보드</title>
   <link rel="stylesheet" href="/static/style.css">
-  <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js" defer></script>
+  <!-- 차트 라이브러리(Lightweight Charts 4.2.0, SRI 고정)는 app.js 가 비동기로 주입한다: CDN 이 느리거나 막혀도 대시보드 데이터는 바로 뜬다 -->
   <script src="/static/app.js" defer></script>
 </head>
 <body>
@@ -15,7 +17,7 @@
   <header class="topbar">
     <div class="brand">
       <h1>트레이딩 대시보드</h1>
-      <span class="version" id="app-version" aria-label="버전"></span>
+      <span class="version" id="app-version"></span>
     </div>
     <div class="engine-controls">
       <span class="badge" id="engine-badge" data-state="unknown" aria-live="polite">
@@ -45,7 +47,7 @@
   <main>
     <!-- ======================================================= 대시보드 -->
     <section id="panel-dashboard" role="tabpanel" aria-labelledby="tab-dashboard" data-panel="dashboard">
-      <div class="status-meta" id="status-meta" aria-label="엔진 정보">
+      <div class="status-meta" id="status-meta" role="group" aria-label="엔진 정보">
         <span class="chip">모드 <b data-field="mode">-</b></span>
         <span class="chip">브로커 <b data-field="broker">-</b></span>
         <span class="chip">시세 <b data-field="data_source">-</b></span>
@@ -55,7 +57,7 @@
         <span class="chip">시작 <b data-field="started_at">-</b></span>
       </div>
 
-      <div class="kpis" aria-label="핵심 지표">
+      <div class="kpis" role="group" aria-label="핵심 지표">
         <div class="kpi"><span class="kpi-label">총 자산</span><span class="kpi-value" data-kpi="equity"><span class="skeleton"></span></span><span class="kpi-sub" data-kpi-sub="equity"></span></div>
         <div class="kpi"><span class="kpi-label">현금</span><span class="kpi-value" data-kpi="cash"><span class="skeleton"></span></span><span class="kpi-sub" data-kpi-sub="cash"></span></div>
         <div class="kpi"><span class="kpi-label">당일 손익</span><span class="kpi-value" data-kpi="daily_pnl"><span class="skeleton"></span></span><span class="kpi-sub" data-kpi-sub="daily_pnl"></span></div>
@@ -64,7 +66,7 @@
         <div class="kpi"><span class="kpi-label">마지막 갱신</span><span class="kpi-value" data-kpi="updated"><span class="skeleton"></span></span><span class="kpi-sub" data-kpi-sub="updated"></span></div>
       </div>
 
-      <div class="prices" id="price-cards" aria-label="현재가">
+      <div class="prices" id="price-cards" role="group" aria-label="현재가">
         <div class="price-card"><div class="price-symbol"><span class="skeleton"></span></div><div class="price-value"><span class="skeleton"></span></div></div>
         <div class="price-card"><div class="price-symbol"><span class="skeleton"></span></div><div class="price-value"><span class="skeleton"></span></div></div>
       </div>
@@ -78,7 +80,8 @@
               <label>간격 <select id="candle-interval" aria-label="차트 간격"></select></label>
             </div>
           </header>
-          <div class="chart" id="candle-chart" role="img" aria-label="캔들 차트"></div>
+          <div class="chart" id="candle-chart" role="group" aria-label="캔들 차트"></div>
+          <p class="chart-credit">차트: <a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">TradingView</a> Lightweight Charts</p>
           <p class="chart-fallback" id="candle-fallback" hidden>차트 라이브러리(Lightweight Charts)를 불러오지 못했습니다. 인터넷 연결을 확인한 뒤 새로고침하세요.</p>
         </article>
         <article class="card">
@@ -86,7 +89,8 @@
             <h2>자산 추이</h2>
             <span class="muted" id="equity-range"></span>
           </header>
-          <div class="chart" id="equity-chart" role="img" aria-label="자산 추이 차트"></div>
+          <div class="chart" id="equity-chart" role="group" aria-label="자산 추이 차트"></div>
+          <p class="chart-credit">차트: <a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">TradingView</a> Lightweight Charts</p>
           <p class="chart-fallback" id="equity-fallback" hidden>차트 라이브러리를 불러오지 못해 자산 추이를 표시할 수 없습니다.</p>
         </article>
       </div>
@@ -189,7 +193,8 @@
           </article>
           <article class="card">
             <header class="card-head"><h2>자산 곡선</h2></header>
-            <div class="chart chart-sm" id="bt-equity-chart" role="img" aria-label="백테스트 자산 곡선"></div>
+            <div class="chart chart-sm" id="bt-equity-chart" role="group" aria-label="백테스트 자산 곡선"></div>
+            <p class="chart-credit">차트: <a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">TradingView</a> Lightweight Charts</p>
             <p class="chart-fallback" id="bt-equity-fallback" hidden>차트 라이브러리를 불러오지 못해 자산 곡선을 표시할 수 없습니다.</p>
           </article>
           <article class="card">

@@ -4,12 +4,14 @@
 - 엔진: 모의투자 ``Trader`` 를 데몬 스레드에서 시작/정지 (``cli.run`` 의 paper 분기와 같은 배선).
   ``Trader.run_forever`` 는 메인 스레드가 아니면 시그널 핸들러를 설치하지 않으므로 그대로 호출한다.
 - 상태: 프로세스 내 엔진이 있으면 ``Trader.status()``, 없으면 상태 파일(data/state.json) 로 같은 모양의 요약을 만든다.
-  ``external_running`` = 프로세스 내 엔진이 없고 상태 파일이 ``max(3*poll_seconds, 120초)`` 안에 갱신됐을 때
-  (단, 이 프로세스의 엔진이 마지막으로 저장한 파일 그대로면 외부 실행으로 보지 않는다).
-- 시세: 설정된 시세 브로커(``cli._data_config`` 와 같은 sandbox 규칙) 의 ``get_ticker`` / ``get_candles`` (5초 캐시).
+  상태 파일은 **읽기 전용** 으로만 다룬다 (손상 파일을 격리하는 ``StateStore.load`` 는 쓰지 않는다 — 파일은 외부
+  엔진 프로세스의 것이다). ``external_running`` = 프로세스 내 엔진이 없고 상태 파일이 ``max(3*poll_seconds, 120초)``
+  안에 갱신됐을 때 (단, 이 프로세스의 엔진이 마지막으로 저장한 파일 그대로면 외부 실행으로 보지 않는다).
+- 시세: 설정된 시세 브로커(``cli._data_config`` 와 같은 sandbox 규칙) 의 ``get_tickers``/``get_ticker`` /
+  ``get_candles`` (5초 캐시).
 - 자산 이력: 상태를 서빙할 때마다(또는 엔진 실행 중 60초마다) ``equity_history.jsonl`` 에 한 줄 추가
-  (60초에 최대 1점, 최근 10,000줄 유지).
-- 로그: ``config.logging.file`` 의 꼬리를 비밀값 마스킹 후 반환.
+  (60초에 최대 1점, 최근 10,000줄 유지). 다른 대시보드 프로세스가 같은 파일에 썼으면 파일에서 다시 읽어 맞춘다.
+- 로그: ``config.logging.file`` 의 꼬리를 비밀값 마스킹 후 반환 (.env 의 자격증명은 시작 시 마스킹 대상으로 등록).
 
 비밀값은 어떤 응답에도 넣지 않는다. 가짜/데모 시세는 없다.
 """
@@ -33,7 +35,6 @@ from typing import Any
 from tradingbot.brokers import create_broker
 from tradingbot.brokers.base import BaseBroker
 from tradingbot.brokers.paper import PaperBroker
-from tradingbot.cli import _data_broker_name, _data_config
 from tradingbot.config import AppConfig, Credentials
 from tradingbot.engine.state import (
     StateStore,
@@ -51,8 +52,10 @@ from tradingbot.exceptions import (
     DataError,
     TradingBotError,
 )
+from tradingbot.logging_setup import setup_logging
 from tradingbot.models import INTERVAL_SECONDS, ensure_utc, utcnow
 from tradingbot.notify import create_notifier, mask_secrets
+from tradingbot.notify.base import register_secret
 from tradingbot.risk import RiskManager
 from tradingbot.strategies import available_strategies, create_strategy, get_strategy_class
 from tradingbot.web.jobs import BacktestJobRunner
@@ -64,12 +67,16 @@ __all__ = [
     "EQUITY_MAX_LINES",
     "EQUITY_SAMPLE_SEC",
     "PRICE_CACHE_SEC",
+    "STATE_UNREADABLE_MESSAGE",
     "DashboardService",
     "WebError",
+    "data_broker_name",
+    "data_config",
     "error_status",
     "is_loopback_host",
     "make_data_broker",
     "mask_log_line",
+    "register_credential_secrets",
     "tail_lines",
 ]
 
@@ -87,6 +94,10 @@ EQUITY_HISTORY_FILE = "equity_history.jsonl"
 EXTERNAL_MIN_FRESH_SEC = 120.0
 #: 엔진 정지 시 스레드 join 대기 (초)
 ENGINE_STOP_TIMEOUT_SEC = 30.0
+#: 정지 요청이 ``run_forever`` 의 시작(stop 이벤트 초기화) 보다 먼저 도착한 경우 루프 진입을 기다리는 최대 시간 (초)
+ENGINE_START_GRACE_SEC = 5.0
+#: 엔진 스레드가 dict 를 바꾸는 순간 ``Trader.status()`` 가 실패하면 다시 시도하는 횟수
+STATUS_RETRIES = 3
 #: 캔들/거래/자산 조회 상한
 MAX_CANDLES = 1000
 MAX_TRADES = 1000
@@ -97,6 +108,13 @@ MAX_LOG_LINES = 2000
 _SYMBOL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:\-]{1,39}$")
 
 LIVE_START_MESSAGE = "실거래는 터미널에서 tradingbot run --live 로만 시작할 수 있습니다"
+STATE_UNREADABLE_MESSAGE = (
+    "상태 파일을 읽을 수 없습니다 (다른 프로세스가 저장 중이거나 파일이 손상됨). 잠시 후 다시 시도하세요"
+)
+
+#: 시세 전용으로 쓸 때 sandbox 를 끄는 브로커 (``tradingbot.cli._data_config`` 와 같은 규칙):
+#: ccxt 테스트넷 시세는 희소하고 실제 시장과 다르다. KIS/Alpaca 의 sandbox(모의투자 서버)는 실제 시세를 주므로 그대로.
+_DATA_SANDBOX_OFF: frozenset[str] = frozenset({"binance", "ccxt"})
 
 
 class WebError(TradingBotError):
@@ -132,10 +150,53 @@ def is_loopback_host(host: str) -> bool:
         return False
 
 
+def data_broker_name(config: AppConfig) -> str:
+    """시세 브로커 이름. ``paper`` 는 시세 출처가 없으므로 ConfigError (``cli._data_broker_name`` 과 같은 규칙)."""
+    name = (config.broker.name or "").lower()
+    if name == "paper":
+        raise ConfigError(
+            "broker.name=paper 는 시세 출처가 없습니다. upbit / binance / ccxt / kis / alpaca 중 하나를 지정하세요 "
+            "(paper 모드는 `tradingbot run` 의 기본값이며 broker.name 은 시세 브로커여야 합니다)"
+        )
+    return name
+
+
+def data_config(config: AppConfig) -> AppConfig:
+    """시세 전용 브로커를 만들 때 쓰는 설정: ccxt 계열은 sandbox 를 꺼 실제 시장 데이터를 받는다."""
+    name = (config.broker.name or "").lower()
+    if name in _DATA_SANDBOX_OFF and config.broker.sandbox:
+        logger.info("%s: 시세 조회 전용이므로 sandbox 를 끄고 실제 시장 데이터를 사용합니다", name)
+        return config.model_copy(update={"broker": config.broker.model_copy(update={"sandbox": False})})
+    return config
+
+
 def make_data_broker(config: AppConfig) -> BaseBroker:
     """시세 전용 브로커 (``cli.run`` paper 분기와 동일: ccxt 계열은 sandbox 해제). ``paper`` 면 ConfigError."""
-    name = _data_broker_name(config)
-    return create_broker(name, _data_config(config))
+    return create_broker(data_broker_name(config), data_config(config))
+
+
+def register_credential_secrets(creds: Credentials | None = None) -> int:
+    """.env 의 자격증명(브로커 키/시크릿/계좌번호, 알림 토큰/웹훅) 을 ``mask_secrets`` 대상으로 등록한다.
+
+    브로커 어댑터는 키를 등록하지 않으므로(알림 채널만 등록), 로그 꼬리를 서빙하는 대시보드가 직접 등록해
+    형식(JSON/dict repr/짧은 값)과 무관하게 정확히 가린다. 텔레그램 chat_id 는 비밀값이 아니고 숫자라 가격과
+    충돌할 수 있어 제외한다. 등록한 값의 수를 돌려준다.
+    """
+    if creds is None:
+        try:
+            creds = Credentials.from_env()
+        except Exception as e:  # noqa: BLE001 - 자격증명 로드 실패가 대시보드를 막지 않게
+            logger.debug("자격증명을 읽지 못해 마스킹 등록을 건너뜁니다: %s", mask_secrets(str(e)))
+            return 0
+    count = 0
+    for name, value in creds.model_dump().items():
+        if name == "telegram_chat_id" or not isinstance(value, str):
+            continue
+        value = value.strip()
+        if len(value) >= 4:
+            register_secret(value)
+            count += 1
+    return count
 
 
 # ============================================================================ 파일 유틸
@@ -180,12 +241,13 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 # ============================================================================ 로그 마스킹
 _MASK = "***"
-#: key=value / key: value 형태의 비밀값 (키 이름에 secret/token/…/key 가 들어가면 값을 가린다. UPBIT_SECRET_KEY 처럼
-#: 밑줄로 이어진 이름도 잡기 위해 \b 대신 접두/접미 단어 문자를 허용한다)
+#: key=value / key: value / "key": "value" / 'key': 'value' 형태의 비밀값. 키 이름에 secret/token/…/key/account_no 가
+#: 들어가면 값을 가린다. UPBIT_SECRET_KEY 처럼 밑줄로 이어진 이름도 잡기 위해 \b 대신 접두/접미 단어 문자를 허용하고,
+#: JSON/dict repr 처럼 키 뒤에 닫는 따옴표가 오는 형태도 허용한다.
 _KV_SECRET_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9])([A-Za-z0-9_\-]*?(?:secret|token|password|passwd|pwd|webhook|authorization|"
-    r"(?:access|secret|app|api|private)[_-]?key|\bkey)[A-Za-z0-9_\-]*?)"
-    r"(\s*[:=]\s*)(['\"]?)(?!\*\*\*)(?!bearer\b)([^\s'\",;]{4,})"
+    r"account[_-]?no|(?:access|secret|app|api|private)[_-]?key|\bkey)[A-Za-z0-9_\-]*?)"
+    r"(['\"]?\s*[:=]\s*)(['\"]?)(?!\*\*\*)(?!bearer\b)([^\s'\",;}\]]{4,})"
 )
 #: Bearer 토큰
 _BEARER_RE = re.compile(r"(?i)\b(bearer\s+)([A-Za-z0-9._\-~+/=]{8,})")
@@ -195,9 +257,10 @@ _SLACK_RE = re.compile(r"(hooks\.slack\.com/services/)([^\s'\"]+)")
 _DISCORD_RE = re.compile(r"((?:discord(?:app)?\.com)/api/webhooks/)([^\s'\"]+)")
 #: JWT (header.payload.signature)
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b")
-#: 긴 토큰처럼 생긴 문자열 (32자 이상 영숫자, 문자와 숫자가 모두 있어야 함 — 긴 단어/숫자열은 제외)
+#: 긴 토큰처럼 생긴 문자열 (20자 이상 영숫자, 문자와 숫자가 모두 있어야 함 — 긴 단어/숫자열은 제외.
+#: Alpaca 키 id 는 20자, Upbit/Alpaca 시크릿 40자, Binance 64자)
 _LONG_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_\-])(?=[A-Za-z0-9_\-]*[A-Za-z])(?=[A-Za-z0-9_\-]*\d)[A-Za-z0-9_\-]{32,}"
+    r"(?<![A-Za-z0-9_\-])(?=[A-Za-z0-9_\-]*[A-Za-z])(?=[A-Za-z0-9_\-]*\d)[A-Za-z0-9_\-]{20,}"
 )
 
 
@@ -239,8 +302,11 @@ def _err(e: BaseException) -> str:
 class DashboardService:
     """대시보드 비즈니스 로직. 모든 공개 메서드는 JSON 직렬화 가능한 dict 를 돌려주거나 ``WebError`` 를 던진다.
 
-    ``broker_factory(config) -> BaseBroker`` 는 시세 브로커 생성기 (기본 ``make_data_broker``; 테스트는
-    ``tradingbot.web.service.create_broker`` 를 monkeypatch 하거나 이 인자로 가짜 피드를 넣는다).
+    - ``broker_factory(config) -> BaseBroker`` 는 시세 브로커 생성기 (기본 ``make_data_broker``; 테스트는
+      ``tradingbot.web.service.create_broker`` 를 monkeypatch 하거나 이 인자로 가짜 피드를 넣는다).
+    - ``engine_log_file`` 이 True 면 이 프로세스가 엔진을 돌리는 동안만 ``config.logging.file`` 에 회전 파일 핸들러를
+      붙인다 (평소에는 외부 ``tradingbot run`` 프로세스의 로그 파일을 건드리지 않는다).
+    - 공개 메서드는 여러 스레드(HTTP 스레드풀)에서 동시에 불릴 수 있다.
     """
 
     def __init__(
@@ -251,6 +317,7 @@ class DashboardService:
         data_dir: Path | None = None,
         broker_factory: Callable[[AppConfig], BaseBroker] | None = None,
         clock: Callable[[], datetime] = utcnow,
+        engine_log_file: bool = False,
     ) -> None:
         self.config = config
         self.config_path: Path | None = Path(config_path) if config_path is not None else None
@@ -259,6 +326,7 @@ class DashboardService:
         self.equity_path: Path = self.data_dir / EQUITY_HISTORY_FILE
         self._broker_factory: Callable[[AppConfig], BaseBroker] = broker_factory or make_data_broker
         self._clock = clock
+        self.engine_log_file = bool(engine_log_file)
 
         self._lock = threading.RLock()
         self._data_broker: BaseBroker | None = None
@@ -269,6 +337,7 @@ class DashboardService:
         self._trader: Trader | None = None
         self._engine_thread: threading.Thread | None = None
         self._engine_broker: BaseBroker | None = None
+        self._engine_starting = False
         self._engine_error: str | None = None
         self._engine_stopped_at: datetime | None = None
         #: 이 프로세스의 엔진이 마지막으로 저장한 상태 파일 서명 (mtime_ns, updated_at) — 외부 실행 오판 방지
@@ -278,7 +347,11 @@ class DashboardService:
         self._equity_lock = threading.Lock()
         self._equity_lines = 0
         self._last_sample_at: datetime | None = None
+        self._equity_sig: tuple[int, int] | None = None
         self._load_equity_meta()
+
+        # 로그 꼬리 마스킹: .env 의 자격증명을 등록 (브로커 어댑터는 키를 등록하지 않는다)
+        register_credential_secrets()
 
         self.jobs = BacktestJobRunner(config, broker_factory=self._broker_factory)
 
@@ -350,33 +423,65 @@ class DashboardService:
         return {"strategies": out}
 
     # ------------------------------------------------------------------ 시세
+    @staticmethod
+    def _valid_price(symbol: str, value: Any) -> float:
+        px = float(value)
+        if not math.isfinite(px) or px <= 0:
+            raise BrokerError(f"{symbol} 현재가가 유효하지 않습니다: {value!r}")
+        return px
+
     def _fetch_prices(self, symbols: Iterable[str]) -> tuple[dict[str, float], dict[str, str]]:
-        """심볼별 현재가 (5초 캐시). 실패한 심볼은 ``errors`` 에 메시지."""
+        """심볼별 현재가 (5초 캐시). 실패한 심볼은 ``errors`` 에 메시지.
+
+        캐시에 없는 심볼은 브로커가 ``get_tickers`` 를 지원하면 **한 번의 호출** 로 받는다 (Upbit ``/v1/ticker`` 는
+        여러 마켓을 한 요청에 돌려준다). 일괄 호출이 실패하면 심볼별 ``get_ticker`` 로 한 번 더 시도한다
+        (잘못된 심볼 하나가 나머지를 막지 않게).
+        """
         prices: dict[str, float] = {}
         errors: dict[str, str] = {}
-        broker: BaseBroker | None = None
-        for sym in symbols:
-            mono = time.monotonic()
-            with self._lock:
+        pending: list[str] = []
+        mono = time.monotonic()
+        with self._lock:
+            for sym in dict.fromkeys(symbols):
                 cached = self._price_cache.get(sym)
-            if cached is not None and mono - cached[1] < PRICE_CACHE_SEC:
-                prices[sym] = cached[0]
+                if cached is not None and mono - cached[1] < PRICE_CACHE_SEC:
+                    prices[sym] = cached[0]
+                else:
+                    pending.append(sym)
+        if not pending:
+            return prices, errors
+
+        broker = self._get_data_broker()
+        fetched: dict[str, float] = {}
+        batch = getattr(broker, "get_tickers", None)
+        batch_ok = False
+        if callable(batch):
+            try:
+                raw = batch(list(pending))
+                for sym in pending:
+                    if sym in raw:
+                        fetched[sym] = self._valid_price(sym, raw[sym])
+                batch_ok = True
+            except Exception as e:  # noqa: BLE001 - 일괄 조회 실패 → 심볼별로 재시도
+                logger.warning("현재가 일괄 조회 실패 (%s), 심볼별로 다시 시도: %s", ", ".join(pending), _err(e))
+        for sym in pending:
+            if sym in fetched:
+                continue
+            if batch_ok:
+                errors[sym] = f"{sym} 현재가 응답에 없습니다"
+                logger.warning("%s 현재가 조회 실패: 일괄 응답에 없음", sym)
                 continue
             try:
-                if broker is None:
-                    broker = self._get_data_broker()
-                px = float(broker.get_ticker(sym))
-                if not math.isfinite(px) or px <= 0:
-                    raise BrokerError(f"{sym} 현재가가 유효하지 않습니다: {px!r}")
-            except WebError:
-                raise
+                fetched[sym] = self._valid_price(sym, broker.get_ticker(sym))
             except Exception as e:  # noqa: BLE001 - 심볼 하나의 실패가 나머지를 막지 않게
                 errors[sym] = _err(e)
                 logger.warning("%s 현재가 조회 실패: %s", sym, _err(e))
-                continue
+        if fetched:
+            stamp = time.monotonic()
             with self._lock:
-                self._price_cache[sym] = (px, time.monotonic())
-            prices[sym] = px
+                for sym, px in fetched.items():
+                    self._price_cache[sym] = (px, stamp)
+            prices.update(fetched)
         return prices, errors
 
     def prices(self, symbols: list[str] | None = None) -> dict[str, Any]:
@@ -461,6 +566,12 @@ class DashboardService:
     def _remember_own_state(self) -> None:
         self._own_state_sig = self._state_signature()
 
+    def _state_mtime(self) -> datetime | None:
+        try:
+            return datetime.fromtimestamp(self.state_store.path.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            return None
+
     def _state_updated_at(self, data: Mapping[str, Any]) -> datetime | None:
         try:
             parsed = dt_from_iso(data.get("updated_at"))
@@ -468,19 +579,29 @@ class DashboardService:
             parsed = None
         if parsed is not None:
             return parsed
-        try:
-            return datetime.fromtimestamp(self.state_store.path.stat().st_mtime, tz=timezone.utc)
-        except OSError:
-            return None
+        return self._state_mtime()
+
+    def _is_fresh(self, when: datetime | None) -> bool:
+        return when is not None and (self.now() - when).total_seconds() <= self._fresh_window_sec()
 
     def _is_external_running(self, data: Mapping[str, Any], updated_at: datetime | None) -> bool:
-        if not data or updated_at is None or self.engine_alive():
-            return False
-        age = (self.now() - updated_at).total_seconds()
-        if age > self._fresh_window_sec():
+        if not data or self.engine_alive() or not self._is_fresh(updated_at):
             return False
         # 이 프로세스의 엔진이 저장한 파일 그대로면 외부 프로세스가 아니다
         return self._own_state_sig is None or self._state_signature() != self._own_state_sig
+
+    def _trader_status(self, trader: Trader) -> dict[str, Any]:
+        """``Trader.status()`` — 엔진 스레드가 포지션/대기 dict 를 바꾸는 순간이면 (RuntimeError) 잠깐 뒤 다시 시도."""
+        last: BaseException | None = None
+        for attempt in range(STATUS_RETRIES):
+            try:
+                return trader.status()
+            except RuntimeError as e:  # dictionary changed size during iteration
+                last = e
+                time.sleep(0.01 * (attempt + 1))
+            except Exception as e:  # noqa: BLE001 - 브로커 조회 실패 등
+                raise WebError(502, f"엔진 상태 조회 실패: {_err(e)}") from e
+        raise WebError(502, f"엔진 상태 조회 실패: {_err(last) if last else '재시도 초과'}")
 
     def status(self) -> dict[str, Any]:
         """``GET /api/status``. 자산을 알 수 있으면 자산 이력에 샘플을 남긴다."""
@@ -489,10 +610,7 @@ class DashboardService:
             engine_error = self._engine_error
         now = self.now()
         if trader is not None:
-            try:
-                st = trader.status()
-            except Exception as e:  # noqa: BLE001 - 브로커 조회 실패는 상태 조회를 막지 않는다
-                raise WebError(502, f"엔진 상태 조회 실패: {_err(e)}") from e
+            st = self._trader_status(trader)
             self.sample_equity(st.get("equity"), now)
             return {
                 "source": "engine",
@@ -527,12 +645,28 @@ class DashboardService:
         }
 
     def _load_state(self) -> dict[str, Any]:
-        if not self.state_store.exists:
+        """상태 파일을 **읽기 전용** 으로 읽는다.
+
+        ``StateStore.load`` 는 손상 파일을 ``state.json.corrupt-…`` 로 옮기므로 쓰지 않는다 — 파일은 외부 엔진의 것이고
+        대시보드는 관찰자다. 파싱할 수 없으면 503 (저장 중이거나 손상) 으로 알리고 파일은 그대로 둔다.
+        """
+        path = self.state_store.path
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        except OSError as e:
+            logger.warning("상태 파일을 읽을 수 없습니다 (%s): %s", path, e)
+            raise WebError(500, "상태 파일을 읽을 수 없습니다 (서버 로그 참고)") from e
+        if not text.strip():
             return {}
         try:
-            return self.state_store.load()
-        except DataError as e:
-            raise WebError(500, f"상태 파일을 읽을 수 없습니다: {_err(e)}") from e
+            data = json.loads(text)
+        except ValueError as e:
+            raise WebError(503, STATE_UNREADABLE_MESSAGE) from e
+        if not isinstance(data, dict):
+            raise WebError(503, STATE_UNREADABLE_MESSAGE)
+        return data
 
     def _status_from_state(self, data: Mapping[str, Any], *, running: bool) -> dict[str, Any]:
         """상태 파일 → ``Trader.status()`` 와 같은 모양의 요약 (현재가는 시세 브로커에서)."""
@@ -695,10 +829,19 @@ class DashboardService:
         return {"trades": rows[:limit], "total": len(rows), "source": source}
 
     # ------------------------------------------------------------------ 자산 이력
+    def _equity_file_sig(self) -> tuple[int, int] | None:
+        """자산 이력 파일의 (크기, mtime_ns). 다른 프로세스가 썼는지 알아내는 데 쓴다. 없으면 None."""
+        try:
+            st = self.equity_path.stat()
+        except OSError:
+            return None
+        return (st.st_size, st.st_mtime_ns)
+
     def _load_equity_meta(self) -> None:
-        """시작 시 파일의 줄 수와 마지막 샘플 시각을 읽는다."""
+        """파일의 줄 수와 마지막 샘플 시각을 읽는다 (시작 시, 그리고 다른 프로세스가 파일을 바꾼 뒤)."""
         self._equity_lines = 0
         self._last_sample_at = None
+        self._equity_sig = self._equity_file_sig()
         if not self.equity_path.is_file():
             return
         try:
@@ -717,12 +860,18 @@ class DashboardService:
             logger.warning("자산 이력 파일을 읽을 수 없습니다 (%s): %s", self.equity_path, e)
 
     def sample_equity(self, equity: Any, now: datetime | None = None) -> bool:
-        """자산 샘플 1점 추가 (60초에 최대 1점, 값이 없으면 건너뜀). 추가했으면 True."""
+        """자산 샘플 1점 추가 (60초에 최대 1점, 값이 없으면 건너뜀). 추가했으면 True.
+
+        같은 디렉터리를 보는 다른 대시보드 프로세스가 파일에 썼으면(크기/mtime 변화) 마지막 샘플 시각과 줄 수를 파일에서
+        다시 읽어 60초 규칙과 정리 기준을 프로세스 간에도 지킨다.
+        """
         value = _num(equity)
         if value is None:
             return False
         now = ensure_utc(now) if now is not None else self.now()
         with self._equity_lock:
+            if self._equity_file_sig() != self._equity_sig:
+                self._load_equity_meta()
             last = self._last_sample_at
             if last is not None and (now - last).total_seconds() < EQUITY_SAMPLE_SEC:
                 return False
@@ -738,6 +887,7 @@ class DashboardService:
             self._equity_lines += 1
             if self._equity_lines > EQUITY_TRIM_AT:
                 self._trim_equity_file()
+            self._equity_sig = self._equity_file_sig()
         return True
 
     def _trim_equity_file(self) -> None:
@@ -750,7 +900,7 @@ class DashboardService:
             logger.warning("자산 이력 정리 실패 (%s): %s", self.equity_path, e)
 
     def equity_history(self, limit: int = 500) -> dict[str, Any]:
-        """``GET /api/equity``. 최근 ``limit`` 점 (오래된→최신)."""
+        """``GET /api/equity``. 최근 ``limit`` 점 (오래된→최신). ``file`` 은 파일 이름만 (경로는 응답에 넣지 않는다)."""
         limit = max(1, min(int(limit), MAX_EQUITY_POINTS))
         points: list[dict[str, Any]] = []
         with self._equity_lock:
@@ -767,39 +917,72 @@ class DashboardService:
             if value is None or not isinstance(t, str):
                 continue
             points.append({"t": t, "equity": value})
-        return {"points": points, "file": str(self.equity_path)}
+        return {"points": points, "file": self.equity_path.name}
 
     # ------------------------------------------------------------------ 로그
     def logs(self, lines: int = 200) -> dict[str, Any]:
-        """``GET /api/logs``. 로그 파일 꼬리 (비밀값 마스킹)."""
+        """``GET /api/logs``. 로그 파일 꼬리 (비밀값 마스킹). ``file`` 은 파일 이름만."""
         n = max(1, min(int(lines), MAX_LOG_LINES))
         file = self.config.logging.file
         if not file:
             return {"file": None, "lines": [], "note": "logging.file 이 설정되지 않아 파일 로그가 없습니다"}
         path = Path(file)
         if not path.is_file():
-            return {"file": str(path), "lines": [], "note": "로그 파일이 아직 없습니다"}
+            return {"file": path.name, "lines": [], "note": "로그 파일이 아직 없습니다"}
         try:
             tail = tail_lines(path, n)
         except OSError as e:
-            raise WebError(500, f"로그 파일을 읽을 수 없습니다: {e}") from e
-        return {"file": str(path), "lines": [mask_log_line(ln) for ln in tail]}
+            logger.warning("로그 파일을 읽을 수 없습니다 (%s): %s", path, e)
+            raise WebError(500, "로그 파일을 읽을 수 없습니다 (서버 로그 참고)") from e
+        return {"file": path.name, "lines": [mask_log_line(ln) for ln in tail]}
 
     # ------------------------------------------------------------------ 엔진
+    def _attach_engine_log_file(self) -> None:
+        """이 프로세스가 엔진을 돌리는 동안만 파일 로그 핸들러를 붙인다 (``engine_log_file`` 일 때)."""
+        if not self.engine_log_file or not self.config.logging.file:
+            return
+        try:
+            setup_logging(self.config.logging)
+        except TradingBotError as e:
+            logger.warning("엔진 파일 로그를 열 수 없어 콘솔에만 기록합니다: %s", _err(e))
+
+    def _detach_engine_log_file(self) -> None:
+        if not self.engine_log_file or not self.config.logging.file:
+            return
+        setup_logging(self.config.logging.model_copy(update={"file": None}))
+
     def start_engine(self) -> dict[str, Any]:
-        """``POST /api/engine/start``. 모의투자 Trader 를 데몬 스레드에서 시작한다."""
+        """``POST /api/engine/start``. 모의투자 Trader 를 데몬 스레드에서 시작한다.
+
+        잠금은 슬롯 예약/해제에만 잡는다 — 브로커 생성·상태 복원(``trader.start``) 은 잠금 밖에서 하므로 그동안에도
+        상태 조회가 막히지 않는다.
+        """
         with self._lock:
             if self.config.is_live:
                 raise WebError(409, LIVE_START_MESSAGE)
-            if self.engine_alive():
+            if self.engine_alive() or self._engine_starting:
                 raise WebError(409, "엔진이 이미 이 프로세스에서 실행 중입니다")
-            data = self._load_state()
+            try:
+                data = self._load_state()
+            except WebError as e:
+                # 읽을 수 없는데 방금 갱신된 파일 = 다른 프로세스가 저장 중일 가능성 → 외부 실행으로 취급
+                if e.status_code == 503 and self._is_fresh(self._state_mtime()):
+                    raise WebError(
+                        409,
+                        "상태 파일이 방금 갱신됐지만 읽을 수 없습니다 (다른 프로세스가 저장 중일 수 있음). "
+                        "잠시 후 다시 시도하세요",
+                    ) from e
+                data = {}
             if data and self._is_external_running(data, self._state_updated_at(data)):
                 raise WebError(
                     409,
                     "다른 프로세스가 상태 파일을 갱신하고 있습니다 (외부 엔진 실행 중). "
                     "그 프로세스를 먼저 종료한 뒤 다시 시도하세요",
                 )
+            self._engine_starting = True
+
+        data_broker: BaseBroker | None = None
+        try:
             try:
                 data_broker = self._broker_factory(self.config)
             except TradingBotError as e:
@@ -814,12 +997,18 @@ class DashboardService:
                 # 상태 복원/검증은 요청 스레드에서 동기적으로 — 설정 오류를 바로 돌려준다
                 trader.start()
             except TradingBotError as e:
-                self._close_broker(data_broker)
                 raise WebError(error_status(e), f"엔진을 시작할 수 없습니다: {_err(e)}") from e
             except Exception as e:  # noqa: BLE001
-                self._close_broker(data_broker)
                 raise WebError(500, f"엔진을 시작할 수 없습니다: {_err(e)}") from e
+        except BaseException:
+            self._close_broker(data_broker)
+            with self._lock:
+                self._engine_starting = False
+            raise
 
+        self._attach_engine_log_file()
+        with self._lock:
+            self._engine_starting = False
             self._engine_error = None
             self._engine_stopped_at = None
             self._trader = trader
@@ -858,6 +1047,7 @@ class DashboardService:
             self._close_broker(trader.broker)
             self._close_broker(data_broker)
             logger.info("웹 대시보드 엔진 스레드 종료")
+            self._detach_engine_log_file()
 
     def _sample_loop(self, trader: Trader, thread: threading.Thread) -> None:
         """엔진 실행 중 60초마다 자산 샘플 (상태 조회가 없어도 자산 곡선이 이어지게)."""
@@ -872,6 +1062,16 @@ class DashboardService:
                 continue
             self.sample_equity(equity)
 
+    @staticmethod
+    def _request_stop(trader: Trader, thread: threading.Thread) -> None:
+        """``trader.stop()`` — ``run_forever`` 는 시작하면서 stop 이벤트를 지우므로, 루프가 아직 시작되지 않았으면
+        (``trader.running`` 이 False) 진입할 때까지 잠깐 기다렸다가 다시 요청한다 (정지 요청 유실 방지)."""
+        trader.stop()
+        deadline = time.monotonic() + ENGINE_START_GRACE_SEC
+        while thread.is_alive() and not trader.running and time.monotonic() < deadline:
+            time.sleep(0.01)
+        trader.stop()
+
     def stop_engine(self) -> dict[str, Any]:
         """``POST /api/engine/stop``. ``Trader.stop()`` 후 최대 30초 join."""
         with self._lock:
@@ -880,7 +1080,7 @@ class DashboardService:
             trader = self._trader
             thread = self._engine_thread
             assert trader is not None and thread is not None
-            trader.stop()
+        self._request_stop(trader, thread)
         thread.join(ENGINE_STOP_TIMEOUT_SEC)
         if thread.is_alive():
             logger.warning(

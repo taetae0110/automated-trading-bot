@@ -18,7 +18,7 @@
   --border-strong: #aeb7c6;
   --text: #171c26;
   --text-muted: #5a6475;
-  --text-faint: #8a93a3;
+  --text-faint: #656d80;
 
   --accent: #2456d6;
   --accent-hover: #1b47b5;
@@ -59,7 +59,7 @@
     --border-strong: #46506a;
     --text: #e7eaf0;
     --text-muted: #a2abbc;
-    --text-faint: #6f788a;
+    --text-faint: #8f99ad;
 
     --accent: #6f9bff;
     --accent-hover: #8db0ff;
@@ -177,6 +177,12 @@ th.num,
   background: color-mix(in oklab, var(--surface) 92%, transparent);
   backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--border);
+}
+
+@media (width < 600px) {
+  .topbar {
+    position: static;
+  }
 }
 
 .brand {
@@ -487,13 +493,24 @@ th.num,
 
 .toast .toast-close {
   flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  min-height: 28px;
+  margin: -5px -6px -5px 0;
+  padding: 0;
   border: 0;
+  border-radius: var(--radius-sm);
   background: none;
   color: var(--text-muted);
   font-size: 1.1rem;
   line-height: 1;
   cursor: pointer;
-  padding: 0 2px;
+}
+
+.toast .toast-close:hover {
+  background: var(--surface-2);
 }
 
 @keyframes toast-in {
@@ -662,6 +679,13 @@ th.num,
   color: var(--text-faint);
 }
 
+.price-error {
+  display: block;
+  color: var(--danger);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 /* ---------------------------------------------------------------- 차트 */
 .chart {
   position: relative;
@@ -690,6 +714,17 @@ th.num,
 }
 
 .chart-fallback[hidden] {
+  display: none;
+}
+
+.chart-credit {
+  margin: 6px 0 0;
+  font-size: 0.74rem;
+  text-align: right;
+  color: var(--text-muted);
+}
+
+.chart-credit[hidden] {
   display: none;
 }
 
@@ -835,7 +870,7 @@ td.empty {
 /* ---------------------------------------------------------------- 폼 */
 .form-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 12px;
 }
 

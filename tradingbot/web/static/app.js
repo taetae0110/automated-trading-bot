@@ -13,6 +13,14 @@
   const MODE_LABEL = { paper: "모의투자", live: "실거래", backtest: "백테스트" };
   const JOB_LABEL = { queued: "대기", running: "실행 중", done: "완료", error: "오류" };
   const LIVE_MSG = "실거래는 터미널에서 tradingbot run --live 로만 시작할 수 있습니다";
+  const BT_RETRY_MAX = 5; // 백테스트 작업 조회가 잠깐 실패해도 이만큼은 재시도
+  // 차트 라이브러리: 정확한 버전 + SRI 해시 고정. app.js 가 직접 주입하므로 CDN 이 느리거나 막혀도 데이터 표시는 막히지 않는다.
+  const CHART_LIB = {
+    src: "https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js",
+    integrity: "sha384-OK7vELvjHdhUFi31JYioPIcRHTROLdcDa6ZsNWgvgLaKj+9JqhU0Ad8g4wz3CXjA",
+    timeoutMs: 15_000,
+    loadingText: "차트 라이브러리를 불러오는 중…",
+  };
   // 백테스트 지표: [키, 한국어 라벨, 포맷] (tradingbot.backtest.metrics 와 동일 순서)
   const METRICS = [
     ["total_return", "총 수익률", "ret"], ["cagr", "연환산 수익률(CAGR)", "ret"],
@@ -29,7 +37,7 @@
   const state = {
     config: null, configPath: null, strategies: [], status: null, quote: "KRW",
     tab: "dashboard", prices: {}, prevPrices: {}, candleKey: "", refreshing: false,
-    engineBusy: false, logTimer: null, lastToasts: new Map(),
+    engineBusy: false, logTimer: null, lastToasts: new Map(), lastEngineError: null,
     bt: { jobId: null, timer: null, current: null },
   };
 
@@ -93,9 +101,11 @@
       year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
     });
   }
+  /** 날짜 경계(YYYY-MM-DD, UTC 자정)는 로컬 시간대로 옮기지 않고 UTC 날짜 그대로 보여 준다 */
   function fmtDate(iso) {
     const t = Date.parse(iso);
-    return Number.isFinite(t) ? new Date(t).toLocaleDateString("ko-KR") : "-";
+    if (!Number.isFinite(t)) return "-";
+    return new Date(t).toLocaleDateString("ko-KR", { year: "numeric", month: "2-digit", day: "2-digit", timeZone: "UTC" });
   }
   function relTime(iso, now = Date.now()) {
     const t = Date.parse(iso);
@@ -198,10 +208,40 @@
     });
   }
 
+  // ------------------------------------------------------------------ 차트 라이브러리 로딩 (비동기, SRI, 시간 제한)
+  const ChartLib = {
+    state: "idle", // idle | loading | ready | failed
+    listeners: [],
+    load() {
+      if (this.state !== "idle") return;
+      if (typeof window.LightweightCharts !== "undefined") { this.settle("ready"); return; }
+      this.state = "loading";
+      const script = document.createElement("script");
+      script.src = CHART_LIB.src;
+      script.async = true;
+      script.integrity = CHART_LIB.integrity;
+      script.crossOrigin = "anonymous";
+      const timer = setTimeout(() => this.settle("failed"), CHART_LIB.timeoutMs);
+      script.addEventListener("load", () => { clearTimeout(timer); this.settle(typeof window.LightweightCharts !== "undefined" ? "ready" : "failed"); });
+      script.addEventListener("error", () => { clearTimeout(timer); this.settle("failed"); });
+      document.head.append(script);
+    },
+    /** 늦게라도 도착하면 failed → ready 로 올라가지만, 그 반대는 없다 */
+    settle(next) {
+      if (this.state === "ready" || this.state === next) return;
+      this.state = next;
+      for (const fn of this.listeners) { try { fn(next); } catch (e) { console.error(e); } }
+    },
+    onSettle(fn) {
+      this.listeners.push(fn);
+      if (this.state === "ready" || this.state === "failed") fn(this.state);
+    },
+  };
+
   // ------------------------------------------------------------------ 차트 (Lightweight Charts v4)
   const Charts = {
     instances: new Set(),
-    ready() { return typeof window.LightweightCharts !== "undefined"; },
+    ready() { return ChartLib.state === "ready" && typeof window.LightweightCharts !== "undefined"; },
     theme() {
       const cs = getComputedStyle(document.documentElement);
       const v = (n) => cs.getPropertyValue(n).trim();
@@ -213,49 +253,93 @@
       const n = parseInt(m[1], 16);
       return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
     },
-    /** 로컬 시간대로 보이도록 UTC 초를 이동 (v4 는 시간대 옵션이 없음) */
-    toTime(iso) {
+    /** ISO → UTC 초 */
+    utcSec(iso) {
       const t = Date.parse(iso);
-      return Number.isFinite(t) ? Math.floor(t / 1000) - new Date(t).getTimezoneOffset() * 60 : null;
+      return Number.isFinite(t) ? Math.floor(t / 1000) : null;
+    },
+    /** 로컬 시간대로 보이도록 UTC 초를 이동 (v4 는 시간대 옵션이 없음).
+        데이터셋마다 마지막 시각의 오프셋 하나만 쓴다 — 시각마다 다른 오프셋을 쓰면 DST 전환 시간에 같은 time 이 두 번 생겨 setData 가 실패한다. */
+    offsetFor(secs) {
+      const ref = secs.length ? secs[secs.length - 1] * 1000 : Date.now();
+      return -new Date(ref).getTimezoneOffset() * 60;
     },
     baseOptions(t) {
       const LW = window.LightweightCharts;
       return {
-        layout: { background: { type: "solid", color: t.surface }, textColor: t.text, fontFamily: t.font },
+        layout: { background: { type: "solid", color: t.surface }, textColor: t.text, fontFamily: t.font, attributionLogo: false },
         grid: { vertLines: { color: t.grid }, horzLines: { color: t.grid } },
         rightPriceScale: { borderColor: t.border },
-        timeScale: { borderColor: t.border, timeVisible: true, secondsVisible: false },
+        // lockVisibleTimeRangeOnResize: 창 크기가 바뀌어도 사용자가 잡은 확대/스크롤 범위를 유지
+        timeScale: { borderColor: t.border, timeVisible: true, secondsVisible: false, lockVisibleTimeRangeOnResize: true },
         crosshair: { mode: LW.CrosshairMode.Normal },
         localization: { locale: "ko-KR" },
         handleScroll: { vertTouchDrag: false },
       };
     },
-    /** kind: "candle" | "line". 라이브러리가 없으면 fallback 문구를 보이고 null 반환 */
+    /** kind: "candle" | "line". 라이브러리가 아직 없으면 자리만 잡아 두고(fallback 문구), 도착하면 materialize 한다.
+        데이터 로드/폴링은 차트와 무관하게 진행된다. */
     create(container, fallback, kind) {
-      if (!this.ready()) { show(container, false); if (fallback) show(fallback, true); return null; }
-      const LW = window.LightweightCharts;
-      const inst = { container, kind, fitted: false, precision: 0, empty: null };
-      inst.chart = LW.createChart(container, { width: container.clientWidth || 300, height: container.clientHeight || 300 });
-      if (kind === "candle") {
-        inst.series = inst.chart.addCandlestickSeries({});
-        inst.volume = inst.chart.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "vol", lastValueVisible: false, priceLineVisible: false });
-        inst.chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
-      } else {
-        inst.series = inst.chart.addAreaSeries({ lineWidth: 2 });
-      }
-      this.applyTheme(inst);
-      const ro = new ResizeObserver((entries) => {
-        const { width, height } = entries[0].contentRect;
-        if (width > 0 && height > 0) {
-          inst.chart.applyOptions({ width, height });
-          if (inst.hasData) { inst.chart.timeScale().fitContent(); inst.fitted = true; }
-        }
-      });
-      ro.observe(container);
+      const card = container.parentElement;
+      const inst = {
+        container, fallback, kind, chart: null, series: null, volume: null, credit: card ? card.querySelector(".chart-credit") : null,
+        fitted: false, precision: 0, empty: null, hasData: false, pending: null, broken: false,
+        failText: fallback ? fallback.textContent : "",
+      };
       this.instances.add(inst);
+      if (this.ready()) this.materialize(inst);
+      else this.setFallback(inst, ChartLib.state === "failed" ? inst.failText : CHART_LIB.loadingText);
       return inst;
     },
+    setFallback(inst, text) {
+      show(inst.container, false);
+      if (inst.credit) show(inst.credit, false);
+      if (inst.fallback) { inst.fallback.textContent = text; show(inst.fallback, true); }
+    },
+    /** 실제 차트 생성. 실패하면 fallback 문구만 남기고 나머지 화면은 계속 동작한다. */
+    materialize(inst) {
+      if (inst.chart || inst.broken) return;
+      try {
+        const LW = window.LightweightCharts;
+        show(inst.container, true);
+        if (inst.fallback) show(inst.fallback, false);
+        if (inst.credit) show(inst.credit, true);
+        inst.chart = LW.createChart(inst.container, { width: inst.container.clientWidth || 300, height: inst.container.clientHeight || 300 });
+        if (inst.kind === "candle") {
+          inst.series = inst.chart.addCandlestickSeries({});
+          inst.volume = inst.chart.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "vol", lastValueVisible: false, priceLineVisible: false });
+          inst.chart.priceScale("vol").applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
+        } else {
+          inst.series = inst.chart.addAreaSeries({ lineWidth: 2 });
+        }
+        this.applyTheme(inst);
+        // 크기만 맞춘다 — fitContent 는 첫 데이터/명시적 변경 때만 (확대 상태 보존)
+        const resize = () => {
+          const width = inst.container.clientWidth;
+          const height = inst.container.clientHeight;
+          if (width > 0 && height > 0) {
+            inst.chart.applyOptions({ width, height });
+            if (inst.hasData && !inst.fitted) { inst.chart.timeScale().fitContent(); inst.fitted = true; }
+          }
+        };
+        if (typeof ResizeObserver === "function") new ResizeObserver(resize).observe(inst.container);
+        else window.addEventListener("resize", resize);
+      } catch (e) {
+        console.error("차트 생성 실패", e);
+        inst.chart = null; inst.series = null; inst.volume = null; inst.broken = true;
+        this.setFallback(inst, `차트를 만들 수 없습니다: ${e && e.message ? e.message : e}`);
+        return;
+      }
+      const pending = inst.pending;
+      inst.pending = null;
+      if (pending) pending();
+    },
+    materializeAll() { for (const inst of this.instances) this.materialize(inst); },
+    failAll() { for (const inst of this.instances) if (!inst.chart && !inst.broken) this.setFallback(inst, inst.failText); },
+    /** 데이터를 받을 수 있는가 (라이브러리 로드 실패/차트 생성 실패면 false) */
+    usable(inst) { return Boolean(inst) && !inst.broken && ChartLib.state !== "failed"; },
     applyTheme(inst) {
+      if (!inst.chart) return;
       const t = this.theme();
       inst.chart.applyOptions({ ...this.baseOptions(t), localization: { locale: "ko-KR", priceFormatter: (p) => fmtNum(p, inst.precision) } });
       if (inst.kind === "candle") {
@@ -277,13 +361,23 @@
       inst.series.applyOptions({ priceFormat: { type: "price", precision: inst.precision, minMove: 10 ** -inst.precision } });
       inst.chart.applyOptions({ localization: { locale: "ko-KR", priceFormatter: (p) => fmtNum(p, inst.precision) } });
     },
+    /** 시각 파싱 → 오래된 순 정렬 → 고정 오프셋 적용. 같은 초가 겹치면(서버 중복) 하나만 남긴다 */
+    toRows(points, getIso) {
+      const parsed = [];
+      for (const p of points) { const sec = this.utcSec(getIso(p)); if (sec != null) parsed.push([sec, p]); }
+      parsed.sort((a, b) => a[0] - b[0]);
+      const off = this.offsetFor(parsed.map(([sec]) => sec));
+      const rows = [];
+      let last = null;
+      for (const [sec, p] of parsed) { const time = sec + off; if (time === last) continue; last = time; rows.push([time, p]); }
+      return rows;
+    },
     setCandles(inst, candles, fit) {
       inst.rawCandles = candles;
+      if (!inst.chart) { inst.pending = () => this.setCandles(inst, candles, fit); return; }
       const rows = [];
       const vols = [];
-      for (const c of candles) {
-        const time = this.toTime(c.t);
-        if (time == null) continue;
+      for (const [time, c] of this.toRows(candles, (c) => c.t)) {
         rows.push({ time, open: c.o, high: c.h, low: c.l, close: c.c });
         vols.push({ time, value: c.v, color: c.c >= c.o ? inst.volColors.up : inst.volColors.down });
       }
@@ -295,15 +389,9 @@
       if (fit || !inst.fitted) { inst.chart.timeScale().fitContent(); inst.fitted = true; }
     },
     setLine(inst, points, emptyText) {
+      if (!inst.chart) { inst.pending = () => this.setLine(inst, points, emptyText); return; }
       const rows = [];
-      let last = null;
-      for (const p of points) {
-        const time = this.toTime(p.t);
-        if (time == null || !isNum(p.equity) || time === last) continue; // 같은 초 중복 제거
-        rows.push({ time, value: Number(p.equity) });
-        last = time;
-      }
-      rows.sort((a, b) => a.time - b.time);
+      for (const [time, p] of this.toRows(points, (p) => p.t)) if (isNum(p.equity)) rows.push({ time, value: Number(p.equity) });
       this.setPrecision(inst, rows.map((r) => r.value));
       inst.series.setData(rows);
       inst.hasData = rows.length > 0;
@@ -395,18 +483,26 @@
     setField("symbols", (st.symbols || cfg.symbols || []).join(", "));
     setField("started_at", st.started_at ? fmtDateTime(st.started_at) : "-");
 
-    // 엔진 배지 / 버튼
-    const mode = payload.source === "engine" ? "internal" : payload.external_running ? "external" : "stopped";
+    // 엔진 배지 / 버튼. engine_error: 이 프로세스의 엔진 스레드가 예외로 죽었을 때 서버가 넣어 주는 (마스킹된) 메시지
+    const engineError = typeof payload.engine_error === "string" && payload.engine_error.trim() ? payload.engine_error.trim() : null;
+    if (engineError && engineError !== state.lastEngineError) {
+      state.lastEngineError = engineError;
+      Toast.show(`엔진이 오류로 종료되었습니다: ${engineError}`, "error", 12_000);
+    }
+    const crashed = Boolean(engineError) && payload.source !== "engine";
+    const mode = payload.source === "engine" ? "internal" : payload.external_running ? "external" : crashed ? "crashed" : "stopped";
     const badge = $("#engine-badge");
-    badge.dataset.state = mode;
-    $("#engine-badge-text").textContent = mode === "internal" ? "실행 중 · 내부" : mode === "external" ? "실행 중 · 외부 프로세스" : "정지";
+    badge.dataset.state = mode === "crashed" ? "error" : mode;
+    $("#engine-badge-text").textContent = { internal: "실행 중 · 내부", external: "실행 중 · 외부 프로세스", crashed: "정지 · 오류 종료" }[mode] || "정지";
     const isLive = cfg.mode === "live";
     const start = $("#btn-start");
     const stop = $("#btn-stop");
     let hint = "";
     if (mode === "external") { hint = "다른 프로세스(터미널의 tradingbot run)가 상태 파일을 사용 중이라 여기서는 제어할 수 없습니다."; start.disabled = true; stop.disabled = true; }
-    else if (mode === "internal") { start.disabled = true; stop.disabled = false; hint = "이 웹 서버 안에서 모의투자 엔진이 실행 중입니다."; }
+    else if (mode === "internal") { start.disabled = true; stop.disabled = false; hint = payload.stop_pending ? "정지 요청을 보냈습니다. 엔진이 종료되는 중입니다…" : "이 웹 서버 안에서 모의투자 엔진이 실행 중입니다."; }
+    else if (mode === "crashed") { start.disabled = isLive; stop.disabled = true; hint = `엔진이 오류로 종료되었습니다: ${engineError}${isLive ? "" : " — 원인을 확인한 뒤 시작으로 다시 실행할 수 있습니다."}`; }
     else { start.disabled = isLive; stop.disabled = true; if (isLive) hint = LIVE_MSG; else if (payload.source === "state_file") hint = "저장된 상태 파일만 있습니다. 시작을 누르면 모의투자 엔진을 이 서버에서 실행합니다."; }
+    if (mode === "external" && engineError) hint += ` (이전 내부 엔진 오류: ${engineError})`;
     start.title = start.disabled ? (isLive ? LIVE_MSG : mode === "internal" ? "이미 실행 중입니다" : "외부 프로세스가 실행 중입니다") : "모의투자 엔진 시작";
     stop.title = stop.disabled ? (mode === "external" ? "외부 프로세스는 터미널에서 종료하세요" : "실행 중인 내부 엔진이 없습니다") : "엔진 정지";
     $("#engine-hint").textContent = hint;
@@ -489,6 +585,7 @@
 
   function renderPrices(payload) {
     const prices = payload.prices || {};
+    const errors = payload.errors && typeof payload.errors === "object" ? payload.errors : {};
     const root = $("#price-cards");
     clear(root);
     const symbols = (state.config && state.config.symbols) || Object.keys(prices);
@@ -498,10 +595,12 @@
       const prev = state.prevPrices[sym];
       let delta = null;
       if (isNum(price) && isNum(prev) && Number(prev) !== 0) delta = (Number(price) - Number(prev)) / Number(prev);
+      const err = typeof errors[sym] === "string" && errors[sym] ? errors[sym] : null;
       const meta = el("div", { class: "price-meta" });
       if (delta != null && Math.abs(delta) > 0) meta.append(el("span", { class: pnlClass(delta), text: `${delta > 0 ? "▲" : "▼"} ${fmtPct(delta)} ` }));
       meta.append("갱신 ", payload.at ? relNode(payload.at) : "-");
-      root.append(el("div", { class: "price-card" },
+      if (err) meta.append(el("span", { class: "price-error", text: `조회 실패: ${err}` }));
+      root.append(el("div", { class: "price-card", title: err ? `${sym} 시세 조회 실패: ${err}` : null },
         el("div", { class: "price-symbol", text: sym }),
         el("div", { class: `price-value ${isNum(price) ? "" : "muted"}`, text: isNum(price) ? `${fmtPrice(price)} ${state.quote}` : "시세 없음" }),
         meta));
@@ -517,8 +616,8 @@
     const key = `${symbol}|${interval}`;
     const changed = key !== state.candleKey;
     state.candleKey = key;
-    if (!dash.candle) return;
-    if (changed) Charts.setEmpty(dash.candle, "불러오는 중…");
+    if (!Charts.usable(dash.candle)) return;
+    if (changed && dash.candle.chart) Charts.setEmpty(dash.candle, "불러오는 중…");
     try {
       const data = await api(`/api/candles?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=200`);
       if (state.candleKey !== key) return; // 그 사이 선택이 바뀜
@@ -533,7 +632,7 @@
     if (!dash.equity) return;
     const data = await api("/api/equity?limit=500");
     const pts = data.points || [];
-    Charts.setLine(dash.equity, pts, "자산 기록 없음 — 엔진 상태가 조회될 때마다 기록이 쌓입니다");
+    if (Charts.usable(dash.equity)) Charts.setLine(dash.equity, pts, "자산 기록 없음 — 엔진 상태가 조회될 때마다 기록이 쌓입니다");
     $("#equity-range").textContent = pts.length ? `${fmtDateTime(pts[0].t)} ~ ${fmtDateTime(pts[pts.length - 1].t)} (${pts.length}점)` : "";
   }
 
@@ -566,8 +665,6 @@
   }
 
   function setupDashboard() {
-    dash.candle = Charts.create($("#candle-chart"), $("#candle-fallback"), "candle");
-    dash.equity = Charts.create($("#equity-chart"), $("#equity-fallback"), "line");
     const cfg = state.config || {};
     const symSel = $("#candle-symbol");
     const intSel = $("#candle-interval");
@@ -581,6 +678,9 @@
     $("#btn-goto-trades").addEventListener("click", () => activateTab("trades"));
     $("#btn-start").addEventListener("click", () => engineAction("start"));
     $("#btn-stop").addEventListener("click", () => engineAction("stop"));
+    // 차트는 마지막에: 생성 실패해도 위 컨트롤/데이터 갱신은 그대로 동작 (Charts.create 는 예외를 삼키고 fallback 문구를 보인다)
+    dash.candle = Charts.create($("#candle-chart"), $("#candle-fallback"), "candle");
+    dash.equity = Charts.create($("#equity-chart"), $("#equity-fallback"), "line");
   }
 
   // ------------------------------------------------------------------ 엔진 제어
@@ -593,7 +693,12 @@
     try {
       const payload = await api(`/api/engine/${kind}`, { method: "POST", body: {} });
       renderStatus(payload);
-      Toast.show(kind === "start" ? "모의투자 엔진을 시작했습니다" : "엔진을 정지했습니다", "success");
+      if (kind === "stop" && payload && payload.stop_pending) {
+        // 서버가 30초 안에 스레드 종료를 확인하지 못함: 요청은 전달됐고 다음 상태 갱신에서 반영된다
+        Toast.show("정지 요청을 보냈습니다. 엔진이 종료되는 중입니다… 잠시 후 상태가 갱신됩니다.", "info", 10_000);
+      } else {
+        Toast.show(kind === "start" ? "모의투자 엔진을 시작했습니다" : "엔진을 정지했습니다", "success");
+      }
       refreshDashboard();
     } catch (e) {
       toastError(e);
@@ -671,7 +776,7 @@
       const item = e.target.closest("[data-job-id]");
       if (item) openJob(item.dataset.jobId);
     });
-    bt.chart = Charts.create($("#bt-equity-chart"), $("#bt-equity-fallback"), "line");
+    bt.chart = Charts.create($("#bt-equity-chart"), $("#bt-equity-fallback"), "line"); // 라이브러리 미도착/실패 시 fallback 문구
   }
 
   async function submitBacktest(e) {
@@ -705,11 +810,26 @@
   function watchJob(jobId) {
     if (state.bt.timer) clearTimeout(state.bt.timer);
     state.bt.jobId = jobId;
+    let failures = 0;
     const poll = async () => {
       if (state.bt.jobId !== jobId) return;
       let job;
-      try { job = await api(`/api/backtest/${encodeURIComponent(jobId)}`); }
-      catch (e) { toastError(e); $("#bt-status").textContent = `작업 조회 실패: ${e.message}`; return; }
+      try {
+        job = await api(`/api/backtest/${encodeURIComponent(jobId)}`);
+        failures = 0;
+      } catch (e) {
+        if (state.bt.jobId !== jobId) return;
+        failures += 1;
+        const gone = e instanceof ApiError && e.status === 404; // 작업이 메모리에서 밀려남 — 재시도 무의미
+        if (gone || failures > BT_RETRY_MAX) {
+          toastError(e);
+          $("#bt-status").textContent = `작업 조회 실패: ${e.message}${gone ? "" : " — '이전 작업' 목록에서 다시 열 수 있습니다"}`;
+          return;
+        }
+        $("#bt-status").textContent = `작업 조회 재시도 중 (${failures}/${BT_RETRY_MAX})… ${e.message}`;
+        state.bt.timer = setTimeout(poll, Math.min(2000 * failures, 5000));
+        return;
+      }
       if (state.bt.jobId !== jobId) return;
       if (job.status === "done") {
         $("#bt-status").textContent = "완료";
@@ -777,7 +897,7 @@
     const trades = r.trades || [];
     $("#bt-trades-count").textContent = `${trades.length}건`;
     renderTrades($("#bt-trades-table tbody"), trades, "거래 없음");
-    if (bt.chart) Charts.setLine(bt.chart, r.equity || [], "자산 곡선 데이터 없음");
+    if (Charts.usable(bt.chart)) Charts.setLine(bt.chart, r.equity || [], "자산 곡선 데이터 없음");
   }
 
   // ------------------------------------------------------------------ 거래내역
@@ -847,6 +967,14 @@
     setupLogs();
     document.getElementById("confirm-dialog").addEventListener("click", (e) => { if (e.target === e.currentTarget) e.currentTarget.close("cancel"); });
 
+    // 차트 라이브러리는 데이터 로드와 병렬로, 독립적으로 가져온다 (느리거나 실패해도 아래 데이터 표시는 막히지 않음)
+    ChartLib.load();
+    ChartLib.onSettle((result) => {
+      if (result === "ready") { Charts.materializeAll(); return; }
+      Charts.failAll();
+      Toast.show("차트 라이브러리를 불러오지 못해 차트 없이 표시합니다", "info", 8000);
+    });
+
     const [health, config, strategies] = await Promise.allSettled([api("/api/health"), api("/api/config"), api("/api/strategies")]);
     if (health.status === "fulfilled" && health.value && health.value.version) $("#app-version").textContent = `v${health.value.version}`;
     if (config.status === "fulfilled") renderConfig(config.value);
@@ -855,9 +983,9 @@
     else toastError(strategies.reason);
     state.quote = (state.config && state.config.paper && state.config.paper.quote_currency) || state.quote;
 
-    setupDashboard();
-    setupBacktest();
-    if (!Charts.ready()) Toast.show("차트 라이브러리를 불러오지 못해 차트 없이 표시합니다", "info", 8000);
+    // 화면 일부의 초기화 실패가 데이터 갱신/폴링까지 막지 않게 한다
+    try { setupDashboard(); } catch (e) { console.error(e); Toast.show(`대시보드 초기화 오류: ${e.message}`); }
+    try { setupBacktest(); } catch (e) { console.error(e); Toast.show(`백테스트 화면 초기화 오류: ${e.message}`); }
 
     const initial = location.hash.slice(1);
     activateTab(TABS.includes(initial) ? initial : "dashboard");
