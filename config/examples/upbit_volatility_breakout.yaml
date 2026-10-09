@@ -72,7 +72,7 @@ notify:
   notify_on_signal: true      # 돌파 대기 신호도 알림
   notify_on_trade: true       # 체결 알림
   notify_on_error: true       # 오류 알림
-  daily_summary: true         # 일일 요약
+  daily_summary: true         # 일일 요약 (UTC 자정 = 09:00 KST 에 전일 요약 발송)
 
 # 백테스트
 backtest:

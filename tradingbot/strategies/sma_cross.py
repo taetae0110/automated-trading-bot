@@ -6,6 +6,10 @@
 
 ``SMACrossStrategy`` (레지스트리 ``sma_cross``) 와 ``EMACrossStrategy`` (``ema_cross``) 는
 이동평균 함수와 컬럼/사유 라벨만 다르고 로직은 ``_MACrossStrategy`` 를 공유한다.
+
+SMA 는 rolling 창 밖의 과거를 보지 않으므로 ``warmup`` 개의 캔들만 있으면 백테스트(전체 이력) 와 실시간
+(최근 ``candle_limit`` 개) 의 신호가 같다. EMA 는 ``adjust=False`` 재귀가 윈도우 첫 행으로 시드되므로
+시드 가중치가 ``indicators.EWM_SETTLE_TOL`` 이하로 떨어질 때까지의 여유가 더 필요하다 → ``recommended_candles``.
 """
 
 from __future__ import annotations
@@ -42,17 +46,31 @@ class _MACrossStrategy(BaseStrategy):
         prefix = self.label.lower()
         self.fast_col: str = f"{prefix}_fast"
         self.slow_col: str = f"{prefix}_slow"
+        self._short_window_warned = False
 
     # ------------------------------------------------------------------ 서브클래스 훅
     @abstractmethod
     def _moving_average(self, s: pd.Series, period: int) -> pd.Series:
         """이동평균 함수 (SMA 또는 EMA)."""
 
+    def _settle_bars(self) -> int:
+        """시드 효과가 사라질 때까지 warmup 에 더해야 하는 캔들 수 (rolling 평균은 0)."""
+        return 0
+
     # ------------------------------------------------------------------ BaseStrategy
     @property
     def warmup(self) -> int:
         # 장기선이 유효해지는 행(slow-1) 다음 행부터 교차를 판정할 수 있다.
         return self.slow + 1
+
+    @property
+    def recommended_candles(self) -> int:
+        """실시간 엔진이 넘겨야 할 캔들 수 권장치 (백테스트와 같은 신호를 내기 위한 ``engine.candle_limit`` 하한)."""
+        return self.warmup + self._settle_bars()
+
+    def generate_signal(self, symbol: str, df: pd.DataFrame) -> Signal:
+        ind.warn_short_window(self, len(df), logger)
+        return super().generate_signal(symbol, df)
 
     def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
         if "close" not in df.columns:
@@ -123,6 +141,10 @@ class EMACrossStrategy(_MACrossStrategy):
 
     def _moving_average(self, s: pd.Series, period: int) -> pd.Series:
         return ind.ema(s, period)
+
+    def _settle_bars(self) -> int:
+        # 느린 EMA(alpha = 2/(slow+1)) 의 시드가 가장 오래 남는다.
+        return ind.ewm_settle_bars(2.0 / (self.slow + 1))
 
 
 __all__ = ["EMACrossStrategy", "SMACrossStrategy"]

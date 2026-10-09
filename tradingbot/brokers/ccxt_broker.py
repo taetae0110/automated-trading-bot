@@ -3,7 +3,11 @@
 ccxt(https://docs.ccxt.com, 4.5 기준) 의 **통합(unified) API** 만 사용한다. 검증한 사실:
 
 - 거래소 인스턴스: ``ccxt.<exchange_id>({"apiKey", "secret", "password", "enableRateLimit": True, "options": {...}})``.
-  ``set_sandbox_mode(True)`` 는 ``urls["test"]`` 가 있는 거래소만 지원하며 없으면 ``NotSupported`` 를 던진다.
+  생성자는 ``options`` 를 거래소 기본 옵션과 **깊은 병합** 한다 (중첩 dict 의 다른 키는 유지).
+  ``set_sandbox_mode(True)`` 는 ``urls["test"]`` 가 있는 거래소만 지원한다. 키가 없으면 ``NotSupported``, 키는 있지만
+  값이 ``None`` 인 거래소(bithumb, upbit, kraken, kucoin, bitstamp 등 다수) 는 ``TypeError`` 를 던지며, 어느 쪽이든
+  ``urls["api"]`` 는 **실전 서버 그대로** 남는다. 그래서 이 어댑터는 샌드박스를 요청받고 켜지 못하면 ``ConfigError``
+  로 생성을 거부한다 (조용히 실전 서버로 내려가지 않는다).
 - 마켓: ``load_markets()`` → ``{symbol: market}``. market 구조의 ``base/quote/precision.amount/precision.price``,
   ``limits.amount.min``, ``limits.cost.min`` (Binance 는 ``minNotional``) 을 사용한다.
 - 캔들: ``fetch_ohlcv(symbol, timeframe, since(ms), limit)`` → ``[[ts_ms, o, h, l, c, v], ...]`` **오래된→최신**,
@@ -15,8 +19,14 @@ ccxt(https://docs.ccxt.com, 4.5 기준) 의 **통합(unified) API** 만 사용�
   amount, filled, remaining, cost, fee{cost,currency}, fees[], trades[], info}``. 통합 status 는
   ``open | closed | canceled | expired | rejected`` (Binance 는 ``PARTIALLY_FILLED`` 도 ``open``, PENDING_CANCEL 은 ``canceling``).
   Binance 시장가 매수는 ``params["quoteOrderQty"]`` (금액 기준) 를 지원한다.
-  ``options["createMarketBuyOrderRequiresPrice"]`` 가 True 인 거래소는 시장가 매수에 ``price`` 를 넘겨야
-  ccxt 가 ``amount * price`` 로 총액을 계산한다.
+  ``createMarketBuyOrderRequiresPrice`` 옵션이 True 인 거래소는 시장가 매수에 ``price`` 를 넘겨야 ccxt 가
+  ``amount * price`` 로 총액을 계산한다. ccxt 는 이 옵션을 ``options["createOrder"][...]`` → ``options[...]`` →
+  거래소 코드의 기본값 순으로 읽는다 (``Exchange.handle_option``; bitget/bigone/bittrade 는 중첩 키에만 True,
+  btse 는 옵션 없이 코드 기본값 True). 값이 True 인데 price 가 없으면 ccxt 는 **요청을 보내기 전에**
+  ``InvalidOrder("<id> createOrder() requires the price argument for market buy orders ...")`` 를 던진다.
+- ``fetch_open_orders()`` 를 심볼 없이 부르면 Binance 는 기본 옵션 ``fetchOpenOrders.warnWithoutSymbol`` 때문에
+  요청 전에 ``ExchangeError`` 를 던진다 (전체 조회 가중치 80 vs 심볼 지정 6). 어댑터는 BaseBroker 계약(심볼 생략
+  허용) 을 지키려고 이 경고를 기본 옵션으로 해제한다 — 심볼 없는 조회는 비싸므로 자주 부르지 않는다.
 - 정밀도: ``amount_to_precision(symbol, amount)`` 는 **내림(TRUNCATE)** 문자열, 결과가 0 이면 ``InvalidOrder``;
   ``price_to_precision`` 은 반올림(ROUND) 문자열.
 - 예외 계층: ``AuthenticationError(PermissionDenied, AccountSuspended) / InsufficientFunds / InvalidOrder(OrderNotFound)
@@ -34,6 +44,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -91,6 +102,22 @@ MAX_OHLCV_PAGES = 50
 
 #: fetch_balance 응답에서 통화 코드가 아닌 키.
 _BALANCE_META_KEYS = frozenset({"info", "timestamp", "datetime", "free", "used", "total", "debt"})
+
+#: 시장가 매수에 price 가 필요한지 정하는 ccxt 옵션 이름.
+MARKET_BUY_REQUIRES_PRICE_OPTION = "createMarketBuyOrderRequiresPrice"
+
+#: ccxt 가 요청을 보내기 전에 던지는 "시장가 매수에 price 필요" InvalidOrder 의 공통 문구
+#: (bitget/btse/bigone/bittrade 등: ``<id> createOrder() requires the price argument for market buy orders ...``).
+_MARKET_BUY_PRICE_RE = re.compile(
+    r"createOrder\(\) requires (?:the|a) price(?: and amount)? argument.*market buy", re.IGNORECASE
+)
+
+#: 어댑터 기본 ccxt 옵션 (사용자 ``options`` 가 우선): fetchOpenOrders 심볼 생략 경고 해제 (신·구 두 표기).
+#: BaseBroker 계약은 심볼 없는 미체결 조회를 허용한다. Binance 는 그 호출의 가중치가 크므로(80 vs 6) 자주 부르지 않는다.
+DEFAULT_EXCHANGE_OPTIONS: dict[str, Any] = {
+    "warnOnFetchOpenOrdersWithoutSymbol": False,
+    "fetchOpenOrders": {"warnWithoutSymbol": False},
+}
 
 #: ccxt 예외 클래스 이름 → 봇 예외. MRO(구체적 → 일반) 순으로 처음 매칭되는 항목을 쓴다.
 #: 클래스 이름으로 비교하므로 ccxt 가 설치되지 않은 환경(가짜 거래소 주입)에서도 동작한다.
@@ -167,6 +194,23 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _merge_options(target: dict[str, Any], source: Mapping[str, Any]) -> None:
+    """ccxt options 깊은 병합: 중첩 dict 는 재귀적으로 합치고(다른 키 유지) 말단 값은 ``source`` 가 덮어쓴다."""
+    for key, value in source.items():
+        if isinstance(value, Mapping):
+            existing = target.get(key)
+            if not isinstance(existing, dict):
+                existing = target[key] = {}
+            _merge_options(existing, value)
+        else:
+            target[key] = value
+
+
+def is_market_buy_price_error(exc: BaseException) -> bool:
+    """ccxt 가 요청 전에 던지는 "시장가 매수에 price 필요" InvalidOrder (또는 그 변환 결과) 인지."""
+    return _MARKET_BUY_PRICE_RE.search(str(exc)) is not None
+
+
 class CCXTBroker(BaseBroker):
     """ccxt 로 접근하는 현물 거래소 어댑터. 레지스트리 이름 ``ccxt`` / ``binance``."""
 
@@ -196,18 +240,27 @@ class CCXTBroker(BaseBroker):
 
         if exchange is None:
             exchange = self._create_exchange(options)
-        elif options:
-            # 주입된 거래소에도 옵션을 병합한다 (ccxt 인스턴스는 dict 형 options 속성을 가진다).
+        else:
+            # 주입된 거래소에도 어댑터 기본 옵션 → 사용자 옵션 순으로 깊은 병합한다 (ccxt 인스턴스는 dict 형 options).
             current = getattr(exchange, "options", None)
             if isinstance(current, dict):
-                current.update(dict(options))
+                _merge_options(current, DEFAULT_EXCHANGE_OPTIONS)
+                if options:
+                    _merge_options(current, options)
         self._exchange = exchange
         if self.sandbox:
-            try:
-                self._exchange.set_sandbox_mode(True)
-                logger.info("%s 샌드박스(테스트넷) 모드", self.exchange_id)
-            except Exception as e:  # noqa: BLE001 - NotSupported 등, 거래소별로 다름
-                logger.warning("%s 는 샌드박스 모드를 지원하지 않습니다: %s", self.exchange_id, e)
+            self._enable_sandbox()
+
+    def _enable_sandbox(self) -> None:
+        """``set_sandbox_mode(True)``. 거래소가 지원하지 않으면 ConfigError — 실전 서버로 조용히 내려가지 않는다."""
+        try:
+            self._exchange.set_sandbox_mode(True)
+        except Exception as e:  # noqa: BLE001 - NotSupported / TypeError(urls["test"] 가 None) 등 거래소별로 다름
+            raise ConfigError(
+                f"{self.exchange_id} 는 ccxt 샌드박스(테스트넷)를 지원하지 않습니다 ({type(e).__name__}: {e}). "
+                "실전 서버로 거래하려면 broker.sandbox: false 로 명시해 실거래임을 확인하세요"
+            ) from e
+        logger.info("%s 샌드박스(테스트넷) 모드", self.exchange_id)
 
     # ------------------------------------------------------------------ 생성
     def _create_exchange(self, options: Mapping[str, Any] | None) -> Any:
@@ -224,8 +277,11 @@ class CCXTBroker(BaseBroker):
             config["secret"] = self._secret
         if self._password:
             config["password"] = self._password
+        merged: dict[str, Any] = {}
+        _merge_options(merged, DEFAULT_EXCHANGE_OPTIONS)
         if options:
-            config["options"] = dict(options)
+            _merge_options(merged, options)
+        config["options"] = merged  # ccxt 생성자가 거래소 기본 옵션과 다시 깊은 병합한다
         return exchange_cls(config)
 
     @classmethod
@@ -511,10 +567,33 @@ class CCXTBroker(BaseBroker):
 
     # ------------------------------------------------------------------ 주문
     def _market_buy_requires_price(self) -> bool:
+        """ccxt 와 같은 순서로 읽는다: ``options["createOrder"][KEY]`` → ``options[KEY]`` → False.
+
+        거래소 코드에 기본값 True 가 박혀 옵션으로는 알 수 없는 경우(btse 등) 는 ``place_order`` 가
+        ccxt 의 사전 거부(InvalidOrder) 를 보고 현재가로 한 번 재시도한다.
+        """
+        handler = getattr(self._exchange, "handle_option", None)
+        if callable(handler):
+            return bool(handler("createOrder", MARKET_BUY_REQUIRES_PRICE_OPTION, False))
         options = getattr(self._exchange, "options", None)
-        if isinstance(options, Mapping):
-            return bool(options.get("createMarketBuyOrderRequiresPrice"))
-        return False
+        if not isinstance(options, Mapping):
+            return False
+        nested = options.get("createOrder")
+        value = nested.get(MARKET_BUY_REQUIRES_PRICE_OPTION) if isinstance(nested, Mapping) else None
+        if value is None:
+            value = options.get(MARKET_BUY_REQUIRES_PRICE_OPTION)
+        return bool(value)
+
+    def _market_buy_price(self, symbol: str, amount: float, params: dict[str, Any]) -> float | None:
+        """시장가 매수 총액 환산용 현재가. Binance 는 ``params["quoteOrderQty"]`` 에 금액을 넣고 price 는 None."""
+        ticker = self.get_ticker(symbol)
+        if self.exchange_id == "binance":
+            cost = float(self._call(self._exchange.price_to_precision, symbol, amount * ticker))
+            params["quoteOrderQty"] = cost
+            logger.info("%s 시장가 매수 %s 금액 %s (quoteOrderQty)", self.exchange_id, symbol, cost)
+            return None
+        logger.info("%s 시장가 매수 %s %s (가격 %s 기준 총액 환산)", self.exchange_id, symbol, amount, ticker)
+        return ticker
 
     def place_order(
         self,
@@ -552,22 +631,31 @@ class CCXTBroker(BaseBroker):
 
         # 시장가
         order_price: float | None = None
-        if side == OrderSide.BUY and self._market_buy_requires_price():
-            ticker = self.get_ticker(symbol)
-            if self.exchange_id == "binance":
-                cost = float(self._call(self._exchange.price_to_precision, symbol, amount * ticker))
-                params["quoteOrderQty"] = cost
-                logger.info("%s 시장가 매수 %s 금액 %s (quoteOrderQty)", self.exchange_id, symbol, cost)
-            else:
-                order_price = ticker
-                logger.info(
-                    "%s 시장가 매수 %s %s (가격 %s 기준 총액 환산)", self.exchange_id, symbol, amount, ticker
-                )
+        priced = side == OrderSide.BUY and self._market_buy_requires_price()
+        if priced:
+            order_price = self._market_buy_price(symbol, amount, params)
         else:
             logger.info("%s 시장가 %s %s %s", self.exchange_id, ccxt_side, symbol, amount)
-        raw = self._call(
-            self._exchange.create_order, symbol, "market", ccxt_side, amount, order_price, params
-        )
+        try:
+            raw = self._call(
+                self._exchange.create_order, symbol, "market", ccxt_side, amount, order_price, params
+            )
+        except OrderError as e:
+            if priced or side != OrderSide.BUY or not is_market_buy_price_error(e):
+                raise
+            # ccxt 가 요청을 보내기 전에 거부했다 (거래소 코드의 기본값 True 는 옵션으로 알 수 없다: btse 등).
+            # 아직 아무 요청도 나가지 않았으므로 현재가를 넘겨 한 번만 재시도한다.
+            logger.warning(
+                "%s 시장가 매수에 price 가 필요합니다 → 현재가로 재시도 (broker.extra.options 에 %s: true 를 두면 "
+                "재시도 없이 보냅니다): %s",
+                self.exchange_id,
+                MARKET_BUY_REQUIRES_PRICE_OPTION,
+                e,
+            )
+            order_price = self._market_buy_price(symbol, amount, params)
+            raw = self._call(
+                self._exchange.create_order, symbol, "market", ccxt_side, amount, order_price, params
+            )
         return self._parse_order(raw, symbol, side, order_type, amount, None)
 
     def cancel_order(self, order_id: str, symbol: str | None = None) -> bool:
@@ -591,6 +679,7 @@ class CCXTBroker(BaseBroker):
         return self._parse_order(raw, symbol or "", None, None, None, None)
 
     def get_open_orders(self, symbol: str | None = None) -> list[Order]:
+        """미체결 주문. ``symbol`` 생략 시 전체 조회 — Binance 는 가중치가 크다(전체 80 vs 심볼 6) 므로 자주 부르지 않는다."""
         self._require_credentials()
         raw_orders = self._call(self._exchange.fetch_open_orders, symbol)
         return [self._parse_order(o, symbol or "", None, None, None, None) for o in raw_orders or []]
@@ -715,8 +804,11 @@ class CCXTBroker(BaseBroker):
 
 __all__ = [
     "CCXTBroker",
+    "DEFAULT_EXCHANGE_OPTIONS",
     "DEFAULT_QUOTE_CURRENCIES",
+    "MARKET_BUY_REQUIRES_PRICE_OPTION",
     "TIMEFRAMES",
+    "is_market_buy_price_error",
     "split_symbol",
     "to_ccxt_timeframe",
     "translate_ccxt_error",

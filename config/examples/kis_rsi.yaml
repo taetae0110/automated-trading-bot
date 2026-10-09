@@ -4,7 +4,7 @@
 #   - RSI(14) 가 30 을 상향 돌파하면 매수, 70 을 하향 돌파하면 매도
 #   - sandbox: true 면 KIS 모의투자 서버(모의 계좌)를 사용합니다. 실거래 전 반드시 모의투자로 검증하세요
 #   - 정규장 09:00~15:30 KST 에만 주문이 나가며, 장 외 시간에는 엔진이 대기합니다
-#   - .env 에 KIS_APP_KEY / KIS_APP_SECRET / KIS_ACCOUNT_NO (/ KIS_HTS_ID) 필요
+#   - .env 에 KIS_APP_KEY / KIS_APP_SECRET / KIS_ACCOUNT_NO 필요 (KIS_HTS_ID 는 현재 미사용)
 #   - 실행:  tradingbot run -c config/examples/kis_rsi.yaml
 # =============================================================================
 
@@ -72,7 +72,7 @@ notify:
   notify_on_signal: false     # 신호 알림 끔
   notify_on_trade: true       # 체결 알림
   notify_on_error: true       # 오류 알림
-  daily_summary: true         # 장 마감 후 일일 요약
+  daily_summary: true         # 일일 요약 (UTC 자정 = 09:00 KST, 다음 거래일 개장 시점에 전일 요약 발송)
 
 # 백테스트 (KIS 일봉 또는 yfinance '005930.KS' 로 내려받은 데이터 사용)
 backtest:

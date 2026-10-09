@@ -5,6 +5,9 @@
 - prepare: 복사본 반환, 입력 불변, 지표 컬럼 추가
 - 워밍업 / NaN → HOLD
 - 미래 참조 없음: 행 i 에서 잘라 generate_signal 한 결과 == 전체 prepare 후 signal_at(i)
+- 실시간 윈도우 vs 백테스트: 엔진처럼 최근 W 개만 넘긴 generate_signal 이 전체 이력 signal_at(i) 와 같은지.
+  rolling 전략은 W=warmup 에서 이미 같고, ewm 전략(ema_cross/rsi/macd) 은 W=recommended_candles 에서 같다
+  (W=warmup 에서는 시드 효과로 지표값이 달라진다 → recommended_candles 가 필요한 이유)
 - 각 전략의 규칙을 실제 Upbit 캔들(conftest 픽스처) 위에서 독립적으로 재계산해 비교
 - 변동성 돌파: STOP BUY + stop_offset == k*(high-low) + max_holding_bars == 1, MA 필터 HOLD, SELL 없음
 """
@@ -12,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from typing import Any
 
@@ -19,6 +23,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from tradingbot.config import EngineConfig
 from tradingbot.exceptions import ConfigError, DataError
 from tradingbot.models import OrderType, Signal, SignalAction
 from tradingbot.strategies import (
@@ -28,6 +33,7 @@ from tradingbot.strategies import (
     create_strategy,
     get_strategy_class,
 )
+from tradingbot.strategies import indicators as ind
 from tradingbot.strategies.bollinger import BollingerStrategy
 from tradingbot.strategies.macd import MACDStrategy
 from tradingbot.strategies.rsi import RSIStrategy
@@ -158,10 +164,14 @@ INVALID_PARAMS: list[tuple[str, dict[str, Any]]] = [
     ("ema_cross", {"fast": 26, "slow": 12}),
     ("ema_cross", {"fast": 0, "slow": 5}),
     ("rsi", {"period": 0}),
+    ("rsi", {"period": 1}),  # RSI 가 0/100 만 취한다 (docs: 2 이상)
     ("rsi", {"oversold": 70, "overbought": 30}),
     ("rsi", {"oversold": 50, "overbought": 50}),
     ("rsi", {"oversold": -1}),
+    ("rsi", {"oversold": 0}),  # RSI 는 0 에 사실상 닿지 않아 신호가 영원히 없다 (docs: 0 < oversold)
     ("rsi", {"overbought": 101}),
+    ("rsi", {"overbought": 100}),  # docs: overbought < 100
+    ("rsi", {"oversold": 0, "overbought": 100}),
     ("rsi", {"oversold": "x"}),
     ("bollinger", {"period": 1}),
     ("bollinger", {"num_std": 0}),
@@ -171,6 +181,7 @@ INVALID_PARAMS: list[tuple[str, dict[str, Any]]] = [
     ("macd", {"fast": 26, "slow": 12}),
     ("macd", {"fast": 12, "slow": 12}),
     ("macd", {"signal": 0}),
+    ("macd", {"signal": 1}),  # EMA(1) 항등 → 시그널 == MACD → 교차가 영원히 없는 죽은 설정
     ("macd", {"fast": None}),
     ("volatility_breakout", {"k": 0}),
     ("volatility_breakout", {"k": -0.1}),
@@ -188,6 +199,21 @@ def test_invalid_params_raise(cfg):
         EXPECTED_CLASSES[name](**params)
     with pytest.raises(ConfigError):
         create_strategy(name, params)
+
+
+def test_boundary_params_just_inside_limits_are_accepted():
+    """거부 경계 바로 안쪽은 받아야 한다 (minimum=2, 열린 구간 (0, 100))."""
+    assert MACDStrategy(signal=2).signal == 2
+    assert RSIStrategy(period=2).period == 2
+    r = RSIStrategy(oversold=0.5, overbought=99.5)
+    assert (r.oversold, r.overbought) == (0.5, 99.5)
+
+
+def test_macd_signal_one_would_never_fire(daily_df):
+    """signal=1 을 거부하는 이유: 지표 수준에서는 허용되지만 히스토그램이 항상 0 이라 교차가 없다."""
+    macd_line, sig_line, hist = ind.macd(daily_df["close"], 12, 26, 1)
+    assert np.nanmax(np.abs(hist.to_numpy())) == 0.0
+    assert not ind.crossover(macd_line, sig_line).any() and not ind.crossunder(macd_line, sig_line).any()
 
 
 # ====================================================================== prepare
@@ -338,6 +364,191 @@ def test_future_rows_do_not_change_past_signals(cfg, daily_df):
     altered_prepared = strat.prepare(altered)
     for i in range(cut):
         assert_same_signal(strat.signal_at(SYM, base, i), strat.signal_at(SYM, altered_prepared, i))
+
+
+# ====================================================================== 실시간 윈도우 vs 백테스트 (recommended_candles)
+#
+# 실시간 엔진은 최근 candle_limit 개만 generate_signal 에 넘기고, 백테스터는 전체 이력을 prepare 한 뒤 signal_at(i)
+# 를 부른다. prefix 테스트(위) 는 "미래를 잘라도 같다" 만 보장한다. 여기서는 "과거를 잘라도(슬라이딩 윈도우) 같은가"
+# 를 본다: rolling 전략은 W=warmup 이면 같고, ewm 전략은 시드 효과 때문에 W=recommended_candles 가 필요하다.
+
+EWM_NAMES = ("ema_cross", "rsi", "macd")
+EWM_SHORT_CONFIGS = [cfg for cfg in SHORT_CONFIGS if cfg[0] in EWM_NAMES]
+ROLLING_SHORT_CONFIGS = [cfg for cfg in SHORT_CONFIGS if cfg[0] not in EWM_NAMES]
+_META_KEYS = {
+    "ema_cross": ("ema_fast", "ema_slow"),
+    "macd": ("macd", "macd_signal", "macd_hist"),
+    "rsi": ("rsi", "prev_rsi"),
+}
+
+
+def _window(df: pd.DataFrame, i: int, w: int) -> pd.DataFrame:
+    """엔진이 넘기는 것과 같은 최근 w 개 캔들 (행 i 가 마지막)."""
+    return df.iloc[i - w + 1 : i + 1].reset_index(drop=True)
+
+
+def _window_bound(name: str, df: pd.DataFrame) -> float:
+    """recommended_candles 윈도우에서 허용되는 지표 오차 상한.
+
+    EMA 의 윈도우 오차 = (1-α)^(W-1) × |시드 - 전체 이력값| ≤ EWM_SETTLE_TOL × (종가 범위).
+    ema_cross 는 두 EMA 의 차이(×2), macd 히스토그램은 MACD 와 그 EMA 의 차이이므로 여유 있게 ×8.
+    RSI 는 0~100 척도의 절대 오차 (평균 상승/하락폭의 상대 오차 ≤ tol 이 RSI 0.1 포인트를 넘지 않는다).
+    """
+    if name == "rsi":
+        return 0.1
+    price_range = float(df["close"].max() - df["close"].min())
+    return ind.EWM_SETTLE_TOL * price_range * (8.0 if name == "macd" else 2.0)
+
+
+def _indicator_values(name: str, sig: Signal) -> list[float]:
+    assert sig.meta, "워밍업 이후 신호에는 지표값 meta 가 있어야 함"
+    return [float(sig.meta[k]) for k in _META_KEYS[name]]
+
+
+def _cross_margin(name: str, strat: BaseStrategy, prepared: pd.DataFrame, i: int) -> float:
+    """행 i-1, i 에서 교차 기준선까지의 최소 거리. 이보다 작은 오차로도 교차 판정은 뒤집힐 수 있다."""
+    rows = (i - 1, i)
+    if name == "ema_cross":
+        return min(abs(prepared["ema_fast"].iat[j] - prepared["ema_slow"].iat[j]) for j in rows)
+    if name == "macd":
+        return min(abs(prepared["macd_hist"].iat[j]) for j in rows)
+    levels = (strat.oversold, strat.overbought)
+    return min(abs(prepared["rsi"].iat[j] - level) for j in rows for level in levels)
+
+
+class TestRecommendedCandles:
+    def test_default_values(self):
+        # rolling 전략: warmup 과 같다
+        assert SMACrossStrategy().recommended_candles == SMACrossStrategy().warmup == 31
+        assert BollingerStrategy().recommended_candles == 21
+        assert VolatilityBreakoutStrategy().recommended_candles == 1
+        assert VolatilityBreakoutStrategy(ma_period=20).recommended_candles == 21
+        # ewm 전략: warmup + 시드 가중치가 1e-5 이하가 되는 캔들 수
+        # EMA(26): ceil(ln(1e-5) / ln(25/27)) = 150, Wilder RSI(14): ceil(ln(1e-5) / ln(13/14)) = 156
+        assert EMACrossStrategy().recommended_candles == 27 + 150
+        assert MACDStrategy().recommended_candles == 35 + 150
+        assert RSIStrategy().recommended_candles == 16 + 156
+        # MACD 는 slow 와 signal 중 긴 쪽의 EMA 시드가 가장 오래 남는다
+        assert MACDStrategy(fast=5, slow=13, signal=20).recommended_candles == 33 + ind.ewm_settle_bars(
+            2 / 21
+        )
+        assert EMACrossStrategy(fast=5, slow=12).recommended_candles == 13 + ind.ewm_settle_bars(2 / 13)
+        assert RSIStrategy(period=7).recommended_candles == 9 + ind.ewm_settle_bars(1 / 7)
+
+    @pytest.mark.parametrize("cfg", ALL_CONFIGS, ids=_cfg_id)
+    def test_at_least_warmup_and_fits_default_candle_limit(self, cfg):
+        name, params = cfg
+        strat = create_strategy(name, params)
+        assert isinstance(strat.recommended_candles, int)
+        assert strat.recommended_candles >= strat.warmup
+        if name in EWM_NAMES:
+            assert strat.recommended_candles > strat.warmup
+        else:
+            assert strat.recommended_candles == strat.warmup
+        # 기본 설정(candle_limit 300) 은 모든 내장 전략의 기본 파라미터에서 경고 없이 동작해야 한다
+        assert strat.recommended_candles <= EngineConfig().candle_limit
+
+
+@pytest.mark.parametrize("cfg", ROLLING_SHORT_CONFIGS, ids=_cfg_id)
+def test_rolling_strategies_match_backtest_with_warmup_window(cfg, daily_df):
+    """SMA / 볼린저 / 변동성 돌파: W=warmup 슬라이딩 윈도우의 신호가 전체 이력 신호와 같다 (사유/meta 까지)."""
+    name, params = cfg
+    strat = create_strategy(name, params)
+    w = strat.warmup
+    assert strat.recommended_candles == w
+    prepared = strat.prepare(daily_df)
+    for i in range(w - 1, len(daily_df)):
+        assert_same_signal(
+            strat.generate_signal(SYM, _window(daily_df, i, w)), strat.signal_at(SYM, prepared, i)
+        )
+
+
+@pytest.mark.parametrize("fixture", ["daily_df", "candles_df"])
+@pytest.mark.parametrize("cfg", EWM_SHORT_CONFIGS, ids=_cfg_id)
+def test_ewm_strategies_match_backtest_with_recommended_window(cfg, fixture, request):
+    """ema_cross / rsi / macd: W=recommended_candles 슬라이딩 윈도우의 신호가 전체 이력 신호와 같다.
+
+    지표값은 수렴 오차 상한 안에서 같아야 하고, 행동(action) 은 그 오차보다 작은 차이로 기준선에 걸린
+    아슬아슬한 교차(near-tie) 를 빼면 같아야 한다 (그 밖의 행동 불일치 = 수렴 부족).
+    """
+    df = request.getfixturevalue(fixture)
+    name, params = cfg
+    strat = create_strategy(name, params)
+    w = strat.recommended_candles
+    assert strat.warmup < w <= len(df) - 50, "픽스처(200개) 안에서 비교할 bar 가 충분해야 한다"
+    prepared = strat.prepare(df)
+    bound = _window_bound(name, df)
+    compared = 0
+    for i in range(w - 1, len(df)):
+        live = strat.generate_signal(SYM, _window(df, i, w))
+        back = strat.signal_at(SYM, prepared, i)
+        for lv, bv in zip(_indicator_values(name, live), _indicator_values(name, back), strict=True):
+            assert abs(lv - bv) <= bound, (
+                f"{name} bar {i}: live {lv!r} vs backtest {bv!r} (허용 오차 {bound:g})"
+            )
+        if live.action != back.action:
+            margin = _cross_margin(name, strat, prepared, i)
+            assert margin <= bound, (
+                f"{name} bar {i}: live {live.action.value} vs backtest {back.action.value}, "
+                f"기준선까지 거리 {margin:g} > 허용 오차 {bound:g} (수렴 부족)"
+            )
+        else:
+            assert live.order_type == back.order_type and live.strength == back.strength
+        compared += 1
+    assert compared >= 50
+
+
+@pytest.mark.parametrize("cfg", EWM_SHORT_CONFIGS, ids=_cfg_id)
+def test_ewm_strategies_diverge_from_backtest_with_warmup_window(cfg, daily_df):
+    """W=warmup (validate-config 가 통과시키는 최솟값) 은 수렴을 보장하지 않는다 → recommended_candles 가 필요한 이유.
+
+    warmup 크기 윈도우에서는 시드 가중치가 (1-α)^(warmup-1) ≈ 10% 수준이라 지표값이 전체 이력과 뚜렷이 다르다.
+    """
+    name, params = cfg
+    strat = create_strategy(name, params)
+    w = strat.warmup
+    prepared = strat.prepare(daily_df)
+    bound = _window_bound(name, daily_df)
+    worst = 0.0
+    for i in range(w - 1, len(daily_df)):
+        live = strat.generate_signal(SYM, _window(daily_df, i, w))
+        back = strat.signal_at(SYM, prepared, i)
+        worst = max(
+            worst,
+            max(
+                abs(a - b)
+                for a, b in zip(_indicator_values(name, live), _indicator_values(name, back), strict=True)
+            ),
+        )
+    assert worst > bound, f"{name}: warmup 윈도우의 최대 지표 오차 {worst:g} 가 수렴 오차 {bound:g} 이하?"
+
+
+def test_generate_signal_warns_once_below_recommended_candles(daily_df, caplog):
+    """실시간 경로(generate_signal) 에 warmup 이상 recommended_candles 미만의 캔들이 오면 인스턴스당 1회 WARNING."""
+    strat = EMACrossStrategy(fast=5, slow=12)
+    short = daily_df.iloc[: strat.warmup + 5].reset_index(drop=True)
+    with caplog.at_level(logging.WARNING, logger="tradingbot.strategies"):
+        strat.generate_signal(SYM, short)
+        strat.generate_signal(SYM, short)
+    warned = [r for r in caplog.records if "recommended_candles" in r.getMessage()]
+    assert len(warned) == 1
+    assert warned[0].levelno == logging.WARNING and warned[0].name == "tradingbot.strategies.sma_cross"
+    assert "ema_cross" in warned[0].getMessage() and f"{strat.recommended_candles}" in warned[0].getMessage()
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger="tradingbot.strategies"):
+        # 권장치 이상이면 경고 없음
+        EMACrossStrategy(fast=5, slow=12).generate_signal(SYM, daily_df.iloc[: strat.recommended_candles])
+        # warmup 미만은 "데이터 부족" HOLD 가 대신 알린다
+        sig = EMACrossStrategy(fast=5, slow=12).generate_signal(SYM, daily_df.iloc[: strat.warmup - 1])
+        assert sig.is_hold and "데이터 부족" in sig.reason
+        # rolling 전략은 warmup == recommended_candles 라 경고할 일이 없다
+        SMACrossStrategy(fast=5, slow=12).generate_signal(SYM, short)
+        # 다른 ewm 전략도 같은 안전장치를 쓴다
+        RSIStrategy(period=7).generate_signal(SYM, daily_df.iloc[:20])
+        MACDStrategy(fast=5, slow=13, signal=4).generate_signal(SYM, daily_df.iloc[:30])
+    warned = [r for r in caplog.records if "recommended_candles" in r.getMessage()]
+    assert sorted(r.name for r in warned) == ["tradingbot.strategies.macd", "tradingbot.strategies.rsi"]
 
 
 # ====================================================================== 공통 신호 규약

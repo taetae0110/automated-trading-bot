@@ -11,7 +11,8 @@
 - `tradingbot/brokers/base.py`, `tradingbot/brokers/__init__.py` (레지스트리)
 - `tradingbot/strategies/base.py`, `tradingbot/strategies/__init__.py` (레지스트리)
 - `tradingbot/utils/http.py`, `tradingbot/utils/timeutil.py`
-- `tests/conftest.py` — `make_candles()` 합성 데이터
+- `tests/conftest.py` — Upbit 공개 API 에서 받아 캐시한 **실제 캔들** 픽스처 (`real_btc_daily_raw` / `real_btc_hourly_raw` /
+  `real_eth_daily_raw` → `daily_candles`/`daily_df`, `candles`/`candles_df`, `eth_daily_df`). 합성 캔들 생성기는 두지 않는다.
 
 ## 디렉터리
 ```
@@ -312,6 +313,23 @@ tradingbot optimize ...  (선택: 파라미터 그리드 탐색)
 - CSV 백테스트는 네트워크 어댑터를 만들지 않는다: 주식 브로커는 정수 주수 내림, 코인은 기본 1e-8 내림을 쓴다.
 - `optimize` 는 구현하지 않았다. `backtest --report-dir/--trades/--fill-on/--cash/--interval`, `download --interval/--batch/--sleep`,
   `balance --live`, `init --dir`, `--version` 은 계약의 상위 집합.
+- 설정을 읽는 모든 명령(`_load`) 은 YAML 의 **모르는 키** 를 `ConfigError` 로 거부한다 (`find_unknown_keys`: 원본 매핑을
+  `AppConfig.model_fields` 와 재귀 대조, 가장 비슷한 이름을 힌트로). config.py 모델은 pydantic 기본 `extra='ignore'` 라
+  `risk.stop_loss_pc` 같은 오타를 조용히 기본값으로 바꾸기 때문. `strategy.params` / `broker.extra` 안은 자유 형식.
+- `.env` 탐색(`load_project_dotenv`): 현재 디렉터리(상위로 올라가며) → 설정 파일 디렉터리 → 그 상위 순으로 처음 찾은 파일을
+  `override=False` 로 읽는다. `Credentials.from_env()` 의 `load_dotenv()` 기본 탐색은 호출 모듈(config.py) 디렉터리 기준이라
+  `init --dir DIR` 레이아웃이나 비-editable 설치에서는 프로젝트 `.env` 를 보지 않는다. `validate-config` 는 읽은 파일 경로만
+  표시한다 (값은 절대 출력하지 않음).
+- `run` 은 `mode: backtest` 를 거부한다 (`is_live` 만 보던 엔진이 조용히 paper 로 돌던 것을 막음). `backtest` 명령은 `mode` 와 무관.
+- `init` 은 `.env` 를 `os.open(..., 0o600)` 으로 만들고 `--force` 덮어쓰기 뒤에도 0600 으로 조인다 (KIS 토큰 캐시와 같은 기준).
+
+### 계약 변경 요청 (config.py, 미반영)
+위 CLI 보완은 고정 파일 `config.py` 를 건드리지 않은 우회다. 계약을 고칠 때 반영할 사항:
+- 모든 설정 모델에 `model_config = ConfigDict(extra="forbid")` (CLI 외 경로 — 웹 대시보드의 `load_config` 직접 호출 — 도 오타를 거부하게).
+- `Credentials.from_env(dotenv_path=None)` 는 `load_dotenv(dotenv_path or find_dotenv(usecwd=True) or None, override=False)`.
+- `Mode` Literal 에서 `backtest` 제거 (`run` 거부와 문서로 대체 중).
+- `Credentials.kis_hts_id` / `KIS_HTS_ID` 는 어떤 어댑터도 쓰지 않는다 (KIS 조건검색·체결통보 전용). 제거하거나 사용처가 생길 때까지
+  문서에 "현재 미사용(예약)" 으로 둔다.
 
 ### 브로커 세부
 - Upbit: JWT 기본 HS512(`extra.jwt_algorithm: HS256` 선택), query_hash 는 URL 디코딩된 쿼리 문자열의 SHA512 (공식 문서).

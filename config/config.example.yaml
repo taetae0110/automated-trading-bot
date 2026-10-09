@@ -10,9 +10,11 @@
 # - 전략별 예시는 config/examples/ 를 참고하세요.
 # =============================================================================
 
-# 실행 모드: backtest | paper | live
+# 실행 모드: paper | live
 #   paper : 실제 시세로 모의 체결 (PaperBroker). 실제 주문은 나가지 않습니다. (기본값, 권장)
 #   live  : 실거래. broker.name 이 paper 면 안 되며 `tradingbot run --live` 로만 시작됩니다.
+#   (backtest 값도 읽히지만 `tradingbot run` 이 거부합니다. 백테스트는 mode 와 무관하게 `tradingbot backtest` 로 실행)
+# 이 파일에 없는 키(오타, 잘못된 섹션) 는 기본값으로 조용히 대체되지 않고 validate-config/run 이 거부합니다.
 mode: paper
 
 # ----------------------------------------------------------------------------- 브로커
@@ -80,7 +82,7 @@ notify:
   notify_on_signal: false     # 매매 신호가 날 때마다 알림 (잦을 수 있음)
   notify_on_trade: true       # 체결 시 알림
   notify_on_error: true       # 오류 발생 시 알림
-  daily_summary: true         # 일일 요약 알림
+  daily_summary: true         # 일일 요약 알림 (UTC 날짜가 바뀔 때 전일 요약 발송)
 
 # ----------------------------------------------------------------------------- 백테스트
 backtest:

@@ -1,9 +1,10 @@
-"""config/ 예시 설정과 .env.example 검증.
+"""config/ 예시 설정과 .env.example, 문서 일관성 검증.
 
 - 모든 예시 YAML 이 tradingbot.config.load_config 로 읽히고, 모드/샌드박스/전략 파라미터가 유효해야 한다.
 - 모든 키에 한국어 설명 주석이 있어야 한다.
 - .env.example 은 Credentials.from_env 가 읽는 환경변수를 전부 (빈 값으로) 나열해야 한다.
 - 저장소에 샘플 시세 파일이 없어야 한다.
+- README/docs 의 설명(성과 지표 개수, 일일 요약 시점, KIS_HTS_ID 미사용, conftest 실데이터) 이 코드와 맞아야 한다.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from tradingbot.backtest import METRIC_KEYS
 from tradingbot.brokers import available_brokers
 from tradingbot.config import Credentials, load_config
 from tradingbot.models import INTERVAL_SECONDS
@@ -24,6 +26,9 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "config"
 EXAMPLES_DIR = CONFIG_DIR / "examples"
 ENV_EXAMPLE = ROOT / ".env.example"
+PACKAGE_DIR = ROOT / "tradingbot"
+DOCS_DIR = ROOT / "docs"
+README = ROOT / "README.md"
 
 #: 파일 → (broker.name, strategy.name)
 EXPECTED: dict[str, tuple[str, str]] = {
@@ -179,6 +184,55 @@ def test_env_example_yields_no_credentials(monkeypatch: pytest.MonkeyPatch) -> N
     assert all(value is None for value in creds.model_dump().values())
     with pytest.raises(Exception, match="UPBIT_ACCESS_KEY"):
         creds.require("upbit_access_key")
+
+
+@pytest.mark.parametrize("path", ALL_CONFIGS, ids=_config_id)
+def test_daily_summary_comment_states_utc_boundary(path: Path) -> None:
+    """엔진은 UTC 날짜가 바뀔 때 일일 요약을 보낸다 (= 09:00 KST, 국내주식은 개장 시점). '장 마감 후' 같은 설명을 막는다."""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if re.match(r"\s*daily_summary:", line):
+            comment = line.split("#", 1)[1] if "#" in line else ""
+            assert "UTC" in comment, f"{path.name}: 일일 요약 시점은 UTC 자정이다: {line.strip()}"
+            break
+    else:
+        pytest.fail(f"{path.name}: notify.daily_summary 키가 없다")
+
+
+def test_kis_hts_id_is_documented_as_unused() -> None:
+    """KIS_HTS_ID 는 Credentials 가 읽지만 어떤 어댑터도 쓰지 않는다. 사용처가 생기면 문서의 '미사용' 표기를 바꿔야 한다."""
+    users = sorted(
+        p.relative_to(ROOT).as_posix()
+        for p in PACKAGE_DIR.rglob("*.py")
+        if p.name != "config.py" and "hts_id" in p.read_text(encoding="utf-8").lower()
+    )
+    assert users == [], f"KIS_HTS_ID 사용처가 생겼다 — 문서의 '현재 미사용' 표기를 갱신하라: {users}"
+    env_lines = ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
+    assert "미사용" in env_lines[env_lines.index("KIS_HTS_ID=") - 1]
+    for doc in (README, DOCS_DIR / "BROKERS.md", EXAMPLES_DIR / "kis_rsi.yaml"):
+        text = doc.read_text(encoding="utf-8")
+        assert "KIS_HTS_ID" in text and "미사용" in text, doc.name
+        assert "일부 조회 API 에서 필요" not in text, doc.name
+
+
+def test_readme_metric_count_matches_backtester() -> None:
+    m = re.search(r"(\d+)개 성과 지표", README.read_text(encoding="utf-8"))
+    assert m, "README 에 'N개 성과 지표' 문구가 없다"
+    assert int(m.group(1)) == len(METRIC_KEYS)
+
+
+def test_no_synthetic_candle_generator_is_referenced() -> None:
+    """계약 문서(ARCHITECTURE.md) 가 존재하지 않는 합성 캔들 생성기를 고정 파일로 안내하면 안 된다 (가짜 시세 금지)."""
+    needle = "make_" + "candles"  # 이 파일 자신이 걸리지 않게 조합
+    hits = [
+        p.relative_to(ROOT).as_posix()
+        for base, pattern in ((DOCS_DIR, "*.md"), (ROOT / "tests", "*.py"), (PACKAGE_DIR, "*.py"))
+        for p in base.rglob(pattern)
+        if needle in p.read_text(encoding="utf-8")
+    ]
+    assert hits == [] and needle not in README.read_text(encoding="utf-8")
+    arch = (DOCS_DIR / "ARCHITECTURE.md").read_text(encoding="utf-8").splitlines()
+    fixed_file_line = next(line for line in arch if line.startswith("- `tests/conftest.py`"))
+    assert "실제 캔들" in fixed_file_line and "합성 데이터" not in fixed_file_line
 
 
 def test_no_sample_market_data_in_repo() -> None:

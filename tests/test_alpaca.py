@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -168,11 +169,39 @@ CLOCK_CLOSED: dict[str, Any] = {
     "timestamp": "2025-06-24T18:15:22-04:00",
 }
 
+# GET /v2/assets/{symbol_or_asset_id} (reference/get-v2-assets-symbol_or_asset_id 예시, Asset 스키마)
+ASSET_EXAMPLE: dict[str, Any] = {
+    "borrow_status": "easy_to_borrow",
+    "class": "us_equity",
+    "easy_to_borrow": True,
+    "exchange": "NASDAQ",
+    "fractionable": True,
+    "id": "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
+    "marginable": True,
+    "name": "Apple Inc. Common Stock",
+    "shortable": True,
+    "status": "active",
+    "symbol": "AAPL",
+    "tradable": True,
+}
+#: docs/fractional-trading: 소수점 거래는 약 2,000 종목만 가능. 그 밖의 종목은 ``fractionable: false`` 로 응답한다.
+NON_FRACTIONABLE_SYMBOL = "BRK.A"
+
 
 def order_response(**overrides: Any) -> dict[str, Any]:
     out = dict(ORDER_EXAMPLE)
     out.update(overrides)
     return out
+
+
+def asset_response(**overrides: Any) -> dict[str, Any]:
+    out = dict(ASSET_EXAMPLE)
+    out.update(overrides)
+    return out
+
+
+def asset_url(symbol: str = SYMBOL) -> str:
+    return f"{PAPER_BASE_URL}/v2/assets/{symbol}"
 
 
 def iso_z(dt: datetime) -> str:
@@ -349,6 +378,7 @@ class TestAuth:
                 lambda: b.cancel_order("x"),
                 lambda: b.get_order("x"),
                 b.get_open_orders,
+                lambda: b.get_asset(SYMBOL),
             ):
                 with pytest.raises(AuthenticationError) as ei:
                     call()
@@ -698,9 +728,38 @@ class TestAccount:
         assert set(balances) == {"USD"}
         usd = balances["USD"]
         assert usd.currency == "USD"
-        assert usd.total == 123346.11
-        assert usd.available == 122086.5
-        assert usd.locked == pytest.approx(123346.11 - 122086.5)
+        # total 은 다른 어댑터처럼 현금(cash) — equity(123346.11, 포지션 평가액 포함) 가 아니다
+        assert usd.total == 122086.5
+        assert usd.available == 122086.5  # min(cash, non_marginable_buying_power)
+        assert usd.locked == 0.0
+
+    def test_get_balances_locked_is_cash_reserved_by_open_orders(self, broker: AlpacaBroker) -> None:
+        """locked = cash − 비마진 매수 여력 (미체결 주문에 묶인 현금). equity 를 total 로 두면 locked 가 보유 주식 평가액
+        (long_market_value 1259.61) 이 되고 엔진의 fallback equity(현금 + 포지션) 가 포지션을 이중 계산한다."""
+        reserved = {**ACCOUNT_EXAMPLE, "non_marginable_buying_power": "121086.5", "buying_power": "242173"}
+        no_nmbp = {k: v for k, v in ACCOUNT_EXAMPLE.items() if k != "non_marginable_buying_power"}
+        cash_only = {k: v for k, v in no_nmbp.items() if k != "buying_power"}
+        with responses.RequestsMock() as rsps:
+            rsps.get(f"{PAPER_BASE_URL}/v2/account", json=reserved)
+            rsps.get(f"{PAPER_BASE_URL}/v2/account", json=no_nmbp)
+            rsps.get(f"{PAPER_BASE_URL}/v2/account", json=cash_only)
+            usd = broker.get_balances()["USD"]
+            assert usd.total == 122086.5
+            assert usd.available == 121086.5
+            assert usd.locked == pytest.approx(1000.0)
+            assert usd.locked != pytest.approx(float(ACCOUNT_EXAMPLE["long_market_value"]))
+            # non_marginable_buying_power 가 없으면 buying_power(마진 2배) 와 현금 중 작은 값, 둘 다 없으면 현금
+            assert broker.get_balances()["USD"].available == 122086.5
+            assert broker.get_balances()["USD"].available == 122086.5
+
+    def test_base_equity_contract_uses_cash_total(self, broker: AlpacaBroker) -> None:
+        """BaseBroker.get_equity 기본 구현(현금 total + 포지션 평가) 에 넣어도 포지션이 이중 계산되지 않는다."""
+        from tradingbot.brokers.base import BaseBroker
+
+        with responses.RequestsMock() as rsps:
+            rsps.get(f"{PAPER_BASE_URL}/v2/positions", json=[])
+            rsps.get(f"{PAPER_BASE_URL}/v2/account", json=ACCOUNT_EXAMPLE)
+            assert BaseBroker.get_equity(broker, [SYMBOL]) == 122086.5
 
     def test_get_equity_uses_account_equity(self, broker: AlpacaBroker) -> None:
         with responses.RequestsMock() as rsps:
@@ -796,14 +855,58 @@ class TestClock:
             assert broker.round_quantity(SYMBOL, 0.0, fractional=True) == 0.0
             assert broker.round_quantity(SYMBOL, -2.0, fractional=False) == 0.0
             assert len(rsps.calls) == 0
-        # 정규장 여부에 따라
+        # 정규장 여부 + 종목의 fractionable 에 따라 (종목 정보는 심볼당 한 번만 조회)
         with responses.RequestsMock() as rsps:
             rsps.get(f"{PAPER_BASE_URL}/v2/clock", json=CLOCK_OPEN)
+            rsps.get(asset_url(), json=ASSET_EXAMPLE)
             assert broker.round_quantity(SYMBOL, 2.5) == 2.5
+            assert broker.round_quantity(SYMBOL, 2.5) == 2.5
+            assert [c.request.url for c in rsps.calls] == [f"{PAPER_BASE_URL}/v2/clock", asset_url()]
+            assert rsps.calls[1].request.headers[HEADER_KEY_ID] == KEY
         with responses.RequestsMock() as rsps:
             frozen_clock[0] += CLOCK_CACHE_TTL + 1
             rsps.get(f"{PAPER_BASE_URL}/v2/clock", json=CLOCK_CLOSED)
             assert broker.round_quantity(SYMBOL, 2.5) == 2.0
+            assert len(rsps.calls) == 1  # 장외에는 종목 정보도 조회하지 않는다
+
+    def test_round_quantity_non_fractionable_asset_whole_shares(
+        self, broker: AlpacaBroker, frozen_clock: list[float]
+    ) -> None:
+        """정규장이어도 ``fractionable: false`` 종목은 정수 주 (docs/fractional-trading: 소수 주문은
+        "requested asset is not fractionable" 로 거부된다)."""
+        sym = NON_FRACTIONABLE_SYMBOL
+        with responses.RequestsMock() as rsps:
+            rsps.get(f"{PAPER_BASE_URL}/v2/clock", json=CLOCK_OPEN)
+            rsps.get(asset_url(sym), json=asset_response(symbol=sym, exchange="NYSE", fractionable=False))
+            rsps.get(asset_url(), json=ASSET_EXAMPLE)
+            assert broker.round_quantity(sym, 1.775221458) == 1.0
+            assert broker.round_quantity(sym, 0.9) == 0.0
+            assert broker.round_quantity(sym, 0.9, fractional=True) == 0.9  # 명시 정책이 우선
+            assert broker.round_quantity(SYMBOL, 1.775221458) == 1.775221458  # 캐시는 심볼별
+            assert [c.request.url for c in rsps.calls] == [
+                f"{PAPER_BASE_URL}/v2/clock",
+                asset_url(sym),
+                asset_url(),
+            ]
+        assert broker.get_asset(sym)["fractionable"] is False
+        assert broker.get_asset(SYMBOL) == ASSET_EXAMPLE
+
+    def test_asset_lookup_failure_keeps_fractional_and_retries(
+        self, broker: AlpacaBroker, frozen_clock: list[float], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with responses.RequestsMock() as rsps:
+            rsps.get(f"{PAPER_BASE_URL}/v2/clock", json=CLOCK_OPEN)
+            rsps.get(asset_url(), json={"code": 50010000, "message": "internal server error"}, status=500)
+            rsps.get(asset_url(), json=[1])  # 형식 오류
+            rsps.get(asset_url(), json=ASSET_EXAMPLE)
+            with caplog.at_level(logging.WARNING, logger="tradingbot.brokers.alpaca"):
+                assert broker.round_quantity(SYMBOL, 2.5) == 2.5
+                assert broker.round_quantity(SYMBOL, 2.5) == 2.5
+            assert caplog.text.count("종목 정보 조회 실패") == 2
+            assert broker.round_quantity(SYMBOL, 2.5) == 2.5
+            assert len(rsps.calls) == 4  # 실패는 캐시하지 않고 다음에 다시 조회, 성공 후에는 캐시
+            assert broker.round_quantity(SYMBOL, 2.5) == 2.5
+            assert len(rsps.calls) == 4
 
     def test_round_price(self, broker: AlpacaBroker) -> None:
         assert broker.round_price(SYMBOL, 150.255) == 150.26
@@ -838,10 +941,16 @@ class TestPlaceOrder:
         )
         with responses.RequestsMock() as rsps:
             rsps.get(f"{PAPER_BASE_URL}/v2/clock", json=CLOCK_OPEN)
+            rsps.get(asset_url(), json=ASSET_EXAMPLE)
             rsps.post(f"{PAPER_BASE_URL}/v2/orders", json=resp)
             order = broker.place_order(SYMBOL, OrderSide.BUY, 3.6541234567891)
             body = json.loads(rsps.calls[-1].request.body)
             assert rsps.calls[-1].request.headers[HEADER_KEY_ID] == KEY
+            assert [c.request.url for c in rsps.calls] == [
+                f"{PAPER_BASE_URL}/v2/clock",
+                asset_url(),
+                f"{PAPER_BASE_URL}/v2/orders",
+            ]
         assert body == {
             "symbol": SYMBOL,
             "side": "buy",
@@ -862,6 +971,39 @@ class TestPlaceOrder:
         assert order.created_at == datetime(2023, 12, 12, 22, 31, 24, 668464, tzinfo=timezone.utc)
         assert order.updated_at == datetime(2023, 12, 12, 22, 31, 24, 668464, tzinfo=timezone.utc)
         assert order.raw["client_order_id"] == ORDER_EXAMPLE["client_order_id"]
+
+    def test_market_buy_non_fractionable_asset_sends_whole_shares(
+        self, broker: AlpacaBroker, frozen_clock: list[float], candles: list[Candle]
+    ) -> None:
+        """정규장 시장가 매수라도 fractionable=false 종목은 정수 주를 보낸다 (소수 수량은 422 로 거부되어 진입 불가)."""
+        sym = NON_FRACTIONABLE_SYMBOL
+        fill = candles[-1].close
+        resp = order_response(
+            type="market",
+            order_type="market",
+            limit_price=None,
+            time_in_force="day",
+            symbol=sym,
+            qty="1",
+            filled_qty="1",
+            filled_avg_price=str(fill),
+            filled_at="2023-12-12T22:31:25.000000Z",
+            status="filled",
+        )
+        with responses.RequestsMock() as rsps:
+            rsps.get(f"{PAPER_BASE_URL}/v2/clock", json=CLOCK_OPEN)
+            rsps.get(asset_url(sym), json=asset_response(symbol=sym, exchange="NYSE", fractionable=False))
+            rsps.post(f"{PAPER_BASE_URL}/v2/orders", json=resp)
+            order = broker.place_order(sym, OrderSide.BUY, 1.775221458)
+            body = json.loads(rsps.calls[-1].request.body)
+            assert [c.request.method for c in rsps.calls] == ["GET", "GET", "POST"]
+        assert body["qty"] == "1" and body["symbol"] == sym and body["type"] == "market"
+        assert order.quantity == 1.0 and order.status == OrderStatus.FILLED
+        # 1주 미만이면 HTTP 없이 거부 (clock/종목 정보는 캐시)
+        with responses.RequestsMock() as rsps:
+            with pytest.raises(OrderError):
+                broker.place_order(sym, OrderSide.BUY, 0.9)
+            assert len(rsps.calls) == 0
 
     def test_market_sell_outside_session_whole_shares(
         self, broker: AlpacaBroker, frozen_clock: list[float]

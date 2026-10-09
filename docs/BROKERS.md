@@ -13,9 +13,10 @@
 
 ## 공통 규약
 
-- **키는 `.env` 에만** 둔다 (`tradingbot init` 이 `.env.example` 을 복사). YAML/코드/로그에 넣지 않는다. 어댑터는
+- **키는 `.env` 에만** 둔다 (`tradingbot init` 이 `.env.example` 을 권한 600 으로 복사). YAML/코드/로그에 넣지 않는다. 어댑터는
   `Credentials.from_env()` 로 읽고, 키가 없어도 생성은 되며 비공개 API 호출 시에만 `AuthenticationError("... 환경변수 필요")`
-  가 난다.
+  가 난다. CLI 는 명령 시작 시 현재 디렉터리(상위 포함) → 설정 파일 디렉터리 → 그 상위 순으로 `.env` 를 찾아 먼저 읽는다
+  (`Credentials.from_env()` 의 기본 탐색은 python-dotenv 규칙대로 패키지 디렉터리 기준이라 현재 디렉터리를 보지 않는다).
 - 모든 시각은 UTC aware. 거래소의 KST/ET 응답은 즉시 UTC 로 변환한다. `get_candles` 는 오래된 → 최신 순이고
   미완성 캔들은 제외하며 (`include_partial=False`), `end` 는 **미포함(exclusive)** 이다.
 - 네트워크/API 오류는 `BrokerError` 계열로 변환된다: `AuthenticationError`(401/403/키 오류), `RateLimitError`(429),
@@ -121,7 +122,8 @@ broker:
 3. `.env`:
    - `KIS_APP_KEY`, `KIS_APP_SECRET`
    - `KIS_ACCOUNT_NO` : `12345678-01` (종합계좌 8자리 - 상품코드 2자리) 또는 `1234567801`
-   - `KIS_HTS_ID` : 선택
+   - `KIS_HTS_ID` : **현재 미사용 (예약)**. 이 어댑터가 쓰는 엔드포인트(시세/일봉/분봉/주문/취소/잔고/체결조회/휴장일) 는
+     HTS ID 가 필요 없다. 조건검색(psearch)·관심종목·체결통보(WebSocket) 를 붙일 때 쓰도록 필드만 남겨 둔다
 4. 접근 토큰(`POST /oauth2/tokenP`) 은 약 1일 유효하고 **발급이 1분당 1회로 제한** 된다. 어댑터가
    `~/.tradingbot/kis_token_<paper|real>.json` (권한 600) 에 캐시해 재사용하며 만료/401/`EGW00123` 시 1회 재발급한다.
    경로는 `broker.extra.token_path` 로 바꿀 수 있다. 토큰 파일은 `.gitignore` 에 포함되어 있다.

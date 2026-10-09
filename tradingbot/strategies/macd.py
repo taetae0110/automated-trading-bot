@@ -6,6 +6,10 @@
 
 MACD = EMA(fast) - EMA(slow), 시그널 = MACD 의 EMA(signal), 히스토그램 = MACD - 시그널
 (``indicators.macd``, 모든 EMA 는 adjust=False).
+
+``signal`` 은 2 이상이어야 한다: EMA(1) 은 항등이라 시그널 == MACD, 히스토그램 == 0 이 되어 교차가 영원히 없다.
+모든 EMA 가 윈도우 첫 행으로 시드되므로 실시간 엔진의 ``candle_limit`` 는 ``warmup``(NaN 이 아닌 최소) 이 아니라
+``recommended_candles``(시드 효과가 사라지는 길이) 이상이어야 백테스트와 같은 신호가 난다.
 """
 
 from __future__ import annotations
@@ -34,17 +38,32 @@ class MACDStrategy(BaseStrategy):
         super().__init__(**params)
         self.fast: int = ind.as_period(self.params["fast"], "fast")
         self.slow: int = ind.as_period(self.params["slow"], "slow")
-        self.signal: int = ind.as_period(self.params["signal"], "signal")
+        # signal=1 이면 ema(macd, 1) 이 항등 → 히스토그램이 항상 0 → 신호가 전혀 나오지 않는 죽은 설정
+        self.signal: int = ind.as_period(self.params["signal"], "signal", minimum=2)
         if self.fast >= self.slow:
             raise ValueError(f"{self.name}: fast({self.fast}) 는 slow({self.slow}) 보다 작아야 합니다")
         self.params["fast"] = self.fast
         self.params["slow"] = self.slow
         self.params["signal"] = self.signal
+        self._short_window_warned = False
 
     @property
     def warmup(self) -> int:
         # MACD 유효 시작 = slow-1, 시그널 유효 시작 = slow+signal-2 → 교차 판정은 slow+signal-1 부터.
         return self.slow + self.signal
+
+    @property
+    def recommended_candles(self) -> int:
+        """실시간 엔진이 넘겨야 할 캔들 수 권장치 (백테스트와 같은 신호를 내기 위한 ``engine.candle_limit`` 하한).
+
+        시그널 선은 MACD 선(느린 EMA 에 종속) 의 EMA 이므로 가장 긴 기간의 EMA 시드가 사라질 때까지 기다린다.
+        """
+        slowest = max(self.slow, self.signal)
+        return self.warmup + ind.ewm_settle_bars(2.0 / (slowest + 1))
+
+    def generate_signal(self, symbol: str, df: pd.DataFrame) -> Signal:
+        ind.warn_short_window(self, len(df), logger)
+        return super().generate_signal(symbol, df)
 
     def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
         if "close" not in df.columns:

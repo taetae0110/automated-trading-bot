@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import math
@@ -27,7 +28,8 @@ import re
 import shutil
 import sys
 import time
-from collections.abc import Callable, Iterator, Sequence
+import typing
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from enum import Enum
@@ -36,7 +38,9 @@ from typing import Any
 
 import pandas as pd
 import typer
-from pydantic import ValidationError
+import yaml
+from dotenv import find_dotenv, load_dotenv
+from pydantic import BaseModel, ValidationError
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
@@ -64,6 +68,9 @@ __all__ = [
     "DEFAULT_CONFIG_PATH",
     "YFINANCE_DIR",
     "app",
+    "find_project_dotenv",
+    "find_unknown_keys",
+    "load_project_dotenv",
     "main",
     "parse_param_value",
     "parse_params",
@@ -87,6 +94,10 @@ _TEMPLATES: tuple[tuple[str, str], ...] = (
     ("config/config.example.yaml", "config/config.yaml"),
     (".env.example", ".env"),
 )
+#: API 키/토큰이 들어가는 파일: ``init`` 이 소유자만 읽을 수 있게(0600) 만든다 (KIS 토큰 캐시와 같은 기준)
+_SECRET_TEMPLATES: frozenset[str] = frozenset({".env"})
+#: 비밀 파일 권한
+_SECRET_FILE_MODE = 0o600
 
 #: 브로커별 안내 정보 (``brokers`` 명령, 오류 메시지). 레지스트리 이름이 키.
 BROKER_INFO: dict[str, dict[str, Any]] = {
@@ -217,8 +228,91 @@ def _configure_logging(config: AppConfig, *, with_file: bool) -> None:
     setup_logging(LoggingConfig(level=level, file=config.logging.file if with_file else None))
 
 
+def _nested_model(annotation: Any) -> type[BaseModel] | None:
+    """필드 애너테이션이 pydantic 모델(또는 ``Model | None``) 이면 그 모델, 아니면 None."""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    for arg in typing.get_args(annotation):
+        if isinstance(arg, type) and issubclass(arg, BaseModel):
+            return arg
+    return None
+
+
+def find_unknown_keys(
+    data: Mapping[Any, Any], model: type[BaseModel] = AppConfig, prefix: str = ""
+) -> list[str]:
+    """YAML 매핑에서 설정 모델이 모르는 키를 ``섹션.키`` 경로로 모은다 (가장 비슷한 올바른 이름을 덧붙임).
+
+    config.py 의 모델은 pydantic 기본값(``extra='ignore'``) 이라 오타 난 키(``risk.stop_loss_pc``, ``symbol:``) 를
+    조용히 버리고 기본값을 쓴다. 리스크 한도가 그렇게 사라지면 안 되므로 CLI 가 원본 매핑을 ``model_fields`` 와
+    대조해 거부한다. ``strategy.params`` / ``broker.extra`` 처럼 자유 형식 dict 필드 안은 검사하지 않는다
+    (전략 파라미터는 전략 자체가 모르는 키를 거부한다).
+    """
+    unknown: list[str] = []
+    fields = model.model_fields
+    for raw_key, value in data.items():
+        key = str(raw_key)
+        path = f"{prefix}{key}"
+        if key not in fields:
+            close = difflib.get_close_matches(key, list(fields), n=1, cutoff=0.6)
+            hint = f" (혹시 {prefix + close[0]!r}?)" if close else ""
+            unknown.append(f"{path!r}{hint}")
+            continue
+        sub = _nested_model(fields[key].annotation)
+        if sub is not None and isinstance(value, Mapping):
+            unknown.extend(find_unknown_keys(value, sub, prefix=f"{path}."))
+    return unknown
+
+
+def _raw_config_mapping(config_path: Path) -> dict[Any, Any]:
+    """설정 파일의 원본 YAML 매핑 (``load_config`` 가 이미 성공한 뒤 호출되므로 파싱 오류는 없다)."""
+    loaded = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def find_project_dotenv(config_path: Path) -> Path | None:
+    """프로젝트 ``.env`` 탐색: 현재 디렉터리(상위로 올라가며) → 설정 파일 디렉터리 → 그 상위 (``init --dir`` 레이아웃).
+
+    ``Credentials.from_env()`` 의 ``load_dotenv()`` 기본 탐색은 python-dotenv 규칙대로 **호출한 모듈(config.py) 의
+    디렉터리** 에서 위로 올라가므로, 저장소 밖에 만든 프로젝트 디렉터리나 현재 디렉터리의 ``.env`` 는 보지 않는다.
+    그래서 CLI 가 먼저 프로젝트 ``.env`` 를 찾아 환경변수로 읽는다. 처음 찾은 파일 하나만 쓴다.
+    """
+    candidates: list[Path] = []
+    found = find_dotenv(usecwd=True)
+    if found:
+        candidates.append(Path(found))
+    config_dir = Path(config_path).resolve().parent
+    candidates.extend((config_dir / ".env", config_dir.parent / ".env"))
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_project_dotenv(config_path: Path) -> Path | None:
+    """찾은 ``.env`` 를 환경변수로 읽는다 (이미 export 된 값이 우선). 읽은 파일 경로를 돌려준다 (값은 절대 출력하지 않음)."""
+    path = find_project_dotenv(config_path)
+    if path is not None:
+        load_dotenv(dotenv_path=path, override=False)
+        logger.debug(".env 읽음: %s", path)
+    return path
+
+
 def _load(config_path: Path) -> AppConfig:
-    return load_config(config_path)
+    """설정 파일을 읽는다 (모든 명령 공통).
+
+    - 모르는 키(오타) 는 기본값으로 조용히 대체되지 않고 ``ConfigError`` 로 거부한다.
+    - 프로젝트 ``.env`` 를 환경변수로 읽어 이후 ``Credentials.from_env()`` 가 키를 찾게 한다.
+    """
+    config = load_config(config_path)
+    unknown = find_unknown_keys(_raw_config_mapping(config_path))
+    if unknown:
+        raise ConfigError(
+            f"설정 파일 {config_path} 에 알 수 없는 키가 {len(unknown)}개 있습니다 (오타? 모르는 키는 기본값으로 "
+            f"대체하지 않고 거부합니다): {', '.join(unknown)}"
+        )
+    load_project_dotenv(config_path)
+    return config
 
 
 #: 백테스트 중 bar 마다 INFO 를 찍는 로거 (일자 변경/시작 자산 기록, 모의 주문 접수·체결). 결과 표만 보이도록 잠시 올린다.
@@ -496,6 +590,26 @@ def _find_template(rel: str) -> Path:
     raise ConfigError(f"예시 파일을 찾을 수 없습니다: {rel} (저장소 루트에서 실행하세요)")
 
 
+def _copy_template(src: Path, dst: Path, *, secret: bool) -> None:
+    """예시 파일 복사. ``secret`` 이면 처음부터 소유자만 읽을 수 있게(0600) 만든다 (API 키/토큰이 들어갈 파일).
+
+    ``shutil.copyfile`` 은 umask(보통 022) 대로 0644 로 만들어 같은 호스트의 다른 계정이 키를 읽을 수 있다.
+    KIS 토큰 캐시(``_save_token_file``) 와 같은 방식으로 ``os.open(..., 0o600)`` 으로 만들고, ``--force`` 로 기존
+    파일을 덮어쓴 경우에도 권한을 다시 조인다.
+    """
+    if not secret:
+        shutil.copyfile(src, dst)
+        return
+    data = src.read_bytes()
+    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _SECRET_FILE_MODE)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    try:
+        os.chmod(dst, _SECRET_FILE_MODE)
+    except OSError as e:  # pragma: no cover - POSIX 권한을 지원하지 않는 파일시스템
+        logger.debug("%s 권한 변경 실패 (무시): %s", dst, e)
+
+
 @app.command()
 def init(
     force: bool = typer.Option(False, "--force", help="이미 있는 파일도 덮어쓴다"),
@@ -512,7 +626,7 @@ def init(
                 skipped.append(dst)
                 continue
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(src, dst)
+            _copy_template(src, dst, secret=dst_rel in _SECRET_TEMPLATES)
             created.append(dst)
         for p in created:
             _print(f"생성: {p}")
@@ -521,7 +635,8 @@ def init(
         _print()
         _print("다음 단계:")
         _print(
-            "  1. .env 에 사용할 거래소의 API 키를 입력하세요 (모의투자/백테스트는 키 없이도 Upbit/Binance 시세 사용 가능)"
+            "  1. .env 에 사용할 거래소의 API 키를 입력하세요 (모의투자/백테스트는 키 없이도 Upbit/Binance 시세 사용 가능). "
+            ".env 는 소유자만 읽을 수 있게(권한 600) 생성됩니다"
         )
         _print("  2. config/config.yaml 의 broker / symbols / strategy / risk 를 조정하세요")
         _print("  3. tradingbot validate-config -c config/config.yaml")
@@ -598,6 +713,11 @@ def _validate(config: AppConfig) -> tuple[list[str], list[str]]:
 
     if config.is_live:
         warnings.append("mode=live: 실거래 설정입니다. 반드시 모의투자(paper) 로 먼저 검증하세요")
+    if config.mode == "backtest":
+        warnings.append(
+            "mode=backtest: `tradingbot run` 은 이 모드를 거부합니다. 백테스트는 `tradingbot backtest` (mode 와 무관), "
+            "모의투자는 mode: paper 로 두세요"
+        )
     if not config.broker.sandbox and name in ("kis", "alpaca", "binance", "ccxt"):
         warnings.append("broker.sandbox=false: 실전 서버를 사용합니다")
 
@@ -628,12 +748,12 @@ def _cred_field(env_name: str) -> str:
     return {"ccxt_secret": "ccxt_secret"}.get(key, key)
 
 
-def _config_table(config: AppConfig, path: Path) -> Table:
+def _config_table(config: AppConfig, path: Path, dotenv_path: Path | None = None) -> Table:
     strategy_params = ", ".join(f"{k}={v}" for k, v in config.strategy.params.items()) or "(기본값)"
     risk = config.risk
     table = Table(title=f"설정 요약: {path}", show_header=False, box=None, pad_edge=False)
     table.add_column("항목", style="bold")
-    table.add_column("값")
+    table.add_column("값", overflow="fold")  # 긴 경로(.env, 상태 파일) 가 '…' 로 잘리지 않게
     table.add_row("모드", config.mode)
     table.add_row(
         "브로커",
@@ -663,6 +783,10 @@ def _config_table(config: AppConfig, path: Path) -> Table:
         f"초기 자금 {config.backtest.initial_cash:,.0f}, fill_on={config.backtest.fill_on}",
     )
     table.add_row("로깅", f"{config.logging.level}, 파일 {config.logging.file or '(콘솔만)'}")
+    table.add_row(
+        "환경변수 파일",
+        str(dotenv_path) if dotenv_path else "(.env 를 찾지 못함: export 된 환경변수만 사용)",
+    )
     return table
 
 
@@ -672,11 +796,11 @@ def _opt_pct(v: float | None) -> str:
 
 @app.command("validate-config")
 def validate_config(config_path: Path = CONFIG_OPTION) -> None:
-    """설정 파일을 읽고 브로커/전략/간격/리스크 값을 검증한다."""
+    """설정 파일을 읽고 브로커/전략/간격/리스크 값을 검증한다 (모르는 키/오타는 오류, 읽은 .env 경로 표시)."""
     with _cli_errors():
         config = _load(config_path)
         errors, warnings = _validate(config)
-        _console().print(_config_table(config, config_path))
+        _console().print(_config_table(config, config_path, dotenv_path=find_project_dotenv(config_path)))
         _print()
         for w in warnings:
             _print(f"[경고] {w}")
@@ -1259,6 +1383,11 @@ def run(
     with _cli_errors():
         config = _load(config_path)
         _configure_logging(config, with_file=True)
+        if config.mode == "backtest":
+            raise ConfigError(
+                "mode: backtest 는 run 에서 쓸 수 없습니다 (실시간 엔진은 paper 또는 live 만). "
+                f"백테스트는 `tradingbot backtest -c {config_path}` 로 실행하고, 모의투자는 mode: paper 로 두세요"
+            )
         if live and not config.is_live:
             raise ConfigError(
                 f"--live 는 설정 파일의 mode 가 live 일 때만 허용됩니다 (현재 mode={config.mode}). "

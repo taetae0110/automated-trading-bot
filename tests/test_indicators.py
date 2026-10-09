@@ -3,7 +3,9 @@
 - 손계산 검증 벡터 (아주 짧은 수열, 순수 수학) 로 정확성 확인
 - 실제 Upbit 캔들(conftest 픽스처) 로 pandas 참조 계산과 비교
 - 미래 참조 없음 (prefix 로 잘라 계산해도 마지막 값이 동일)
-- 오류 경로 (잘못된 파라미터, 컬럼 누락)
+- 윈도우 시작점 의존성: 과거를 잘라낸 슬라이딩 윈도우에서 rolling 지표는 불변, ewm 지표는 시드 효과로 달라지며
+  ``ewm_settle_bars`` 만큼의 여유가 있으면 ``EWM_SETTLE_TOL`` 안으로 수렴한다
+- 오류 경로 (잘못된 파라미터, 컬럼 누락), 퇴화 파라미터 (macd signal=1, rsi period=1)
 """
 
 from __future__ import annotations
@@ -268,6 +270,64 @@ class TestCross:
             ind.crossover([1, 2, 3], 2)  # type: ignore[arg-type]
 
 
+# ====================================================================== 퇴화 파라미터 (전략이 거부하는 이유)
+
+
+class TestDegenerateParameters:
+    def test_macd_signal_one_has_identical_signal_line_and_zero_histogram(self):
+        # EMA(1) 은 항등 → 시그널 == MACD, 히스토그램 == 0 → crossover/crossunder 가 영원히 False
+        vals = [3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0, 5.0, 3.0]
+        m, sig, hist = ind.macd(_series(vals), fast=2, slow=3, signal=1)
+        pd.testing.assert_series_equal(sig.iloc[2:], m.iloc[2:])
+        assert (hist.iloc[2:] == 0.0).all()
+        assert not ind.crossover(m, sig).any() and not ind.crossunder(m, sig).any()
+
+    def test_rsi_period_one_takes_only_0_or_100(self):
+        # alpha=1 → 평활 없음: 상승이면 100, 하락이면 0, 변화 없음이면 NaN
+        out = ind.rsi(_series([1, 2, 1, 2, 2]), 1)
+        assert out.isna().tolist() == [True, False, False, False, True]
+        assert out.iloc[1:4].tolist() == [100.0, 0.0, 100.0]
+
+
+# ====================================================================== ewm 수렴 캔들 수
+
+
+class TestEwmSettleBars:
+    def test_hand_values(self):
+        # alpha=0.5: 0.5^9 ≈ 1.95e-3 > 1e-3 >= 0.5^10 ≈ 9.8e-4 → 10
+        assert ind.ewm_settle_bars(0.5, 1e-3) == 10
+        # 경계가 정확히 맞아떨어지는 경우 (0.5^2 == 0.25): 부동소수 오차로 3 이 되면 안 된다
+        assert ind.ewm_settle_bars(0.5, 0.25) == 2
+        assert ind.ewm_settle_bars(0.5, 0.5) == 1
+        # 기간 1 (alpha=1): 시드가 남지 않는다
+        assert ind.ewm_settle_bars(1.0) == 0
+        assert ind.ewm_settle_bars(1.0, 0.5) == 0
+        # 기본 tol=1e-5: EMA(26) = ceil(ln(1e-5)/ln(25/27)) = 150, Wilder RSI(14) = ceil(ln(1e-5)/ln(13/14)) = 156
+        assert ind.EWM_SETTLE_TOL == 1e-5
+        assert ind.ewm_settle_bars(2 / 27) == 150
+        assert ind.ewm_settle_bars(1 / 14) == 156
+
+    @pytest.mark.parametrize("alpha", [0.01, 2 / 27, 1 / 14, 2 / 13, 1 / 7, 0.3, 0.9, 0.999])
+    @pytest.mark.parametrize("tol", [1e-2, 1e-3, ind.EWM_SETTLE_TOL, 1e-9])
+    def test_is_minimal_n_with_seed_weight_at_most_tol(self, alpha, tol):
+        n = ind.ewm_settle_bars(alpha, tol)
+        assert n >= 1
+        assert (1 - alpha) ** n <= tol < (1 - alpha) ** (n - 1)
+
+    def test_accepts_numeric_strings_like_other_params(self):
+        assert ind.ewm_settle_bars("0.5", "0.25") == 2
+
+    @pytest.mark.parametrize("bad", [0, -0.1, 1.5, True, "x", None, math.nan, math.inf])
+    def test_bad_alpha_rejected(self, bad):
+        with pytest.raises(ValueError):
+            ind.ewm_settle_bars(bad)
+
+    @pytest.mark.parametrize("bad", [0, 1, 1.5, -1e-3, True, "x", math.nan])
+    def test_bad_tol_rejected(self, bad):
+        with pytest.raises(ValueError):
+            ind.ewm_settle_bars(0.5, bad)
+
+
 # ====================================================================== 파라미터 검증
 
 
@@ -501,3 +561,74 @@ def test_prefix_cut_in_warmup_is_nan(daily_df):
     assert ind.ema(prefix, 20).isna().all()
     assert ind.rsi(prefix, 14).isna().all()
     assert all(s.isna().all() for s in ind.bollinger(prefix, 20))
+
+
+# ====================================================================== 윈도우 시작점 의존성 (슬라이딩 윈도우)
+#
+# 실시간 엔진은 최근 candle_limit 개만 넘긴다 (과거를 잘라냄). prefix 불변성과 달리 이 경우 ewm 지표는
+# 윈도우 첫 행으로 시드되어 값이 달라진다. 오차는 정확히 (1-alpha)^(W-1) × (시드 - 전체 이력값) 이다.
+
+
+def _tail(s: pd.Series, i: int, w: int) -> pd.Series:
+    """행 i 가 마지막인 길이 w 의 슬라이딩 윈도우."""
+    return s.iloc[i - w + 1 : i + 1].reset_index(drop=True)
+
+
+class TestWindowStartDependence:
+    def test_rolling_indicators_are_window_invariant(self, daily_df):
+        close = daily_df["close"]
+        full_sma, full_bb = ind.sma(close, 20), ind.bollinger(close, 20, 2.0)
+        for i in range(40, len(close), 7):
+            window = _tail(close, i, 20)  # 정확히 period 개면 충분하다
+            assert ind.sma(window, 20).iat[-1] == pytest.approx(full_sma.iat[i], rel=1e-12)
+            for full, part in zip(full_bb, ind.bollinger(window, 20, 2.0), strict=True):
+                assert part.iat[-1] == pytest.approx(full.iat[i], rel=1e-12)
+
+    @pytest.mark.parametrize("w", [12, 30, 60])
+    def test_ema_window_error_is_seed_weight_times_seed_gap(self, daily_df, w):
+        """윈도우 EMA 와 전체 이력 EMA 의 차이 == (1-α)^(W-1) × (윈도우 첫 종가 - 그 행의 전체 이력 EMA). 정확한 항등식."""
+        close = daily_df["close"]
+        full = ind.ema(close, 12)
+        alpha = 2 / 13
+        checked = 0
+        for i in range(max(w, 12) - 1 + 11, len(close), 9):
+            j = i - w + 1
+            err = ind.ema(_tail(close, i, w), 12).iat[-1] - full.iat[i]
+            expected = (1 - alpha) ** (w - 1) * (close.iat[j] - full.iat[j])
+            assert err == pytest.approx(expected, rel=1e-9, abs=1e-3)
+            checked += 1
+        assert checked >= 10
+
+    def test_period_sized_window_is_not_converged(self, daily_df):
+        """warmup 길이(=period) 윈도우의 EMA 는 전체 이력과 뚜렷이 다르다 (시드 가중치 (1-α)^(period-1) ≈ 14%)."""
+        close = daily_df["close"]
+        full = ind.ema(close, 12)
+        worst = max(
+            abs(ind.ema(_tail(close, i, 12), 12).iat[-1] - full.iat[i]) for i in range(30, len(close))
+        )
+        assert worst > ind.EWM_SETTLE_TOL * float(close.max() - close.min())
+
+    def test_ewm_indicators_converge_after_settle_bars(self, daily_df):
+        """period + ewm_settle_bars 길이의 윈도우면 EMA / RSI / MACD 모두 EWM_SETTLE_TOL 안으로 수렴한다."""
+        close = daily_df["close"]
+        price_range = float(close.max() - close.min())
+        tol = ind.EWM_SETTLE_TOL
+        w_ema = 12 + ind.ewm_settle_bars(2 / 13)
+        w_rsi = 7 + 1 + ind.ewm_settle_bars(1 / 7)  # 첫 변화량이 NaN 이라 +1
+        w_macd = 13 + 4 + ind.ewm_settle_bars(2 / 14)
+        full_ema, full_rsi, full_macd = ind.ema(close, 12), ind.rsi(close, 7), ind.macd(close, 5, 13, 4)
+        start = max(w_ema, w_rsi, w_macd) - 1
+        assert start <= len(close) - 50
+        for i in range(start, len(close), 3):
+            assert abs(ind.ema(_tail(close, i, w_ema), 12).iat[-1] - full_ema.iat[i]) <= tol * price_range
+            assert abs(ind.rsi(_tail(close, i, w_rsi), 7).iat[-1] - full_rsi.iat[i]) <= 0.1
+            for full, part in zip(full_macd, ind.macd(_tail(close, i, w_macd), 5, 13, 4), strict=True):
+                assert abs(part.iat[-1] - full.iat[i]) <= 8 * tol * price_range
+
+    def test_atr_converges_after_settle_bars(self, candles_df):
+        w = 14 + 1 + ind.ewm_settle_bars(1 / 14)
+        full = ind.atr(candles_df, 14)
+        tr_range = float(ind.true_range(candles_df).max())
+        for i in range(w - 1, len(candles_df), 5):
+            window = candles_df.iloc[i - w + 1 : i + 1].reset_index(drop=True)
+            assert abs(ind.atr(window, 14).iat[-1] - full.iat[i]) <= ind.EWM_SETTLE_TOL * tr_range

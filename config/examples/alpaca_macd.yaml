@@ -73,7 +73,7 @@ notify:
   notify_on_signal: false     # 신호 알림 끔
   notify_on_trade: true       # 체결 알림
   notify_on_error: true       # 오류 알림
-  daily_summary: true         # 장 마감 후 일일 요약
+  daily_summary: true         # 일일 요약 (UTC 자정 = 19:00/20:00 ET, 장 마감 후 발송)
 
 # 백테스트 (Alpaca bars 또는 yfinance 'AAPL' 로 내려받은 데이터 사용)
 backtest:

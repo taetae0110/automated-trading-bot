@@ -59,6 +59,11 @@ class BollingerStrategy(BaseStrategy):
         # 밴드 유효 시작 = 인덱스 period-1 → 교차 판정은 그 다음 행부터.
         return self.period + 1
 
+    @property
+    def recommended_candles(self) -> int:
+        """실시간 엔진이 넘겨야 할 캔들 수 권장치. rolling 지표라 창 밖의 과거를 보지 않으므로 warmup 과 같다."""
+        return self.warmup
+
     def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
         if "close" not in df.columns:
             raise DataError(f"{self.name}: 'close' 컬럼이 필요합니다")

@@ -4,15 +4,21 @@
 - 입력은 ``pd.Series`` (보통 종가) 또는 OHLC 컬럼을 가진 ``pd.DataFrame``.
 - 반환은 입력과 **같은 인덱스**의 Series 이며, 워밍업 구간(값을 계산할 수 없는 앞부분)은 NaN 이다.
 - 모든 계산은 rolling / ewm / shift 만 사용하므로 행 i 의 값은 행 0..i 만으로 결정된다 (미래 참조 없음).
-  따라서 데이터를 행 i 에서 잘라 다시 계산해도 행 i 의 값은 동일하다 (백테스트 = 실시간).
-- EMA / RSI / ATR 의 지수 평활은 ``adjust=False`` 재귀식 (첫 관측값으로 시드) 을 쓴다.
+  따라서 데이터의 **뒤(미래)** 를 행 i 에서 잘라 다시 계산해도 행 i 의 값은 동일하다 (prefix 불변).
+- 단, **앞(과거)** 을 잘라낸 슬라이딩 윈도우(실시간 엔진이 넘기는 최근 ``candle_limit`` 개) 에서는 두 부류가 다르다.
+  rolling 지표(SMA / 볼린저) 는 창 길이만 확보되면 전체 이력과 같은 값을 내지만, ``adjust=False`` 재귀식
+  (첫 관측값으로 시드) 을 쓰는 EMA / RSI / ATR / MACD 는 윈도우의 첫 행으로 시드되므로 시드 가중치
+  ``(1-alpha)^n`` 이 무시할 만큼 작아질 때까지(``ewm_settle_bars``) 전체 이력(백테스트) 과 값이 다르다.
+  전략은 이 여유를 ``recommended_candles`` 로 알린다 (``warmup`` 은 NaN 이 아닌 값이 나오는 최소 개수일 뿐이다).
 
 이 모듈에는 전략들이 공통으로 쓰는 파라미터 검증 유틸(`as_period`, `as_float`),
-`signal_at` 가드(`check_row`), Signal.meta 용 변환 유틸(`float_or_none`)도 둔다.
+`signal_at` 가드(`check_row`), Signal.meta 용 변환 유틸(`float_or_none`),
+ewm 수렴 캔들 수(`ewm_settle_bars`) 와 실시간 경로의 짧은 윈도우 경고(`warn_short_window`) 도 둔다.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any
 
@@ -22,6 +28,7 @@ import pandas as pd
 from tradingbot.exceptions import DataError
 
 __all__ = [
+    "EWM_SETTLE_TOL",
     "as_float",
     "as_period",
     "atr",
@@ -31,15 +38,24 @@ __all__ = [
     "crossover",
     "crossunder",
     "ema",
+    "ewm_settle_bars",
     "float_or_none",
     "fmt_price",
     "macd",
     "rsi",
     "sma",
     "true_range",
+    "warn_short_window",
 ]
 
+logger = logging.getLogger(__name__)
+
 _OHLC_REQUIRED = ("high", "low", "close")
+
+#: ewm 시드 가중치 ``(1-alpha)^n`` 이 이 값 이하로 떨어지면 "수렴" 으로 본다 (``recommended_candles`` 산출 기준).
+#: 실제 KRW-BTC 1d / 1h 각 1000개 캔들에서 슬라이딩 윈도우 신호와 전체 이력 신호를 비교하면 1e-3 은 900 bar 중
+#: 1~2개의 불일치를 남겼고 1e-4 부터 0 이었다. 1e-5 는 그 위에 여유를 둔 값이다 (EMA26: 150, RSI14: 156 캔들).
+EWM_SETTLE_TOL: float = 1e-5
 
 
 # ---------------------------------------------------------------------- 파라미터 검증 유틸
@@ -133,6 +149,51 @@ def fmt_price(x: float) -> str:
     if ax >= 1:
         return f"{x:,.2f}"
     return f"{x:.6g}"
+
+
+# ---------------------------------------------------------------------- ewm 수렴 (슬라이딩 윈도우)
+def ewm_settle_bars(alpha: float, tol: float = EWM_SETTLE_TOL) -> int:
+    """``ewm(adjust=False)`` 재귀에서 시드(윈도우 첫 관측값) 의 가중치 ``(1-alpha)^n`` 이 ``tol`` 이하가 되는 최소 n.
+
+    같은 재귀를 윈도우 첫 행에서 새로 시작하면 전체 이력과의 차이는 정확히 ``(1-alpha)^n × (시드 - 전체 이력값)``
+    으로 줄어든다. 따라서 윈도우가 n 번 이상의 갱신을 포함하면 차이가 ``tol`` 배 이하가 된다.
+    EMA(span=p) 는 ``alpha = 2/(p+1)``, Wilder RSI / ATR 은 ``alpha = 1/p``. ``alpha = 1`` (기간 1) 은 시드가
+    남지 않으므로 0 이다.
+    """
+    alpha = as_float(alpha, "alpha")
+    tol = as_float(tol, "tol")
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError(f"alpha 는 0 초과 1 이하여야 합니다: {alpha}")
+    if not 0.0 < tol < 1.0:
+        raise ValueError(f"tol 은 0 초과 1 미만이어야 합니다: {tol}")
+    if alpha >= 1.0:
+        return 0
+    n = max(0, math.ceil(math.log(tol) / math.log(1.0 - alpha)))
+    # 경계가 정확히 맞아떨어질 때 부동소수 오차로 한 칸 넘치는 것을 바로잡는다 (예: 0.5^2 == 0.25)
+    if n > 0 and (1.0 - alpha) ** (n - 1) <= tol:
+        n -= 1
+    return n
+
+
+def warn_short_window(strategy: Any, n_rows: int, log: logging.Logger | None = None) -> None:
+    """``generate_signal`` (실시간 경로) 보조: ``warmup <= n_rows < recommended_candles`` 이면 인스턴스당 한 번 경고한다.
+
+    ``warmup`` 미만은 ``BaseStrategy.generate_signal`` 이 "데이터 부족" HOLD 로 알리므로 여기서 다루지 않는다.
+    엔진/validate-config 가 ``recommended_candles`` 를 검사하지 않더라도 실거래 로그에 반드시 남기기 위한 안전장치다.
+    전략은 ``__init__`` 에서 ``self._short_window_warned = False`` 를 두고 이 함수를 ``generate_signal`` 앞에서 부른다.
+    """
+    need = int(getattr(strategy, "recommended_candles", 0))
+    if n_rows < strategy.warmup or n_rows >= need or getattr(strategy, "_short_window_warned", False):
+        return
+    strategy._short_window_warned = True
+    (log or logger).warning(
+        "%s: 전달된 캔들 %d개가 권장치 %d개(recommended_candles) 보다 적습니다. ewm 지표(EMA/RSI) 의 시드 효과로 "
+        "전체 이력을 쓰는 백테스트와 다른 신호가 나올 수 있으니 engine.candle_limit 를 %d 이상으로 올리세요",
+        strategy.name,
+        n_rows,
+        need,
+        need,
+    )
 
 
 # ---------------------------------------------------------------------- 내부 헬퍼

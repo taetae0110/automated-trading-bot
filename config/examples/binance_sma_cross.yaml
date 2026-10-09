@@ -72,7 +72,7 @@ notify:
   notify_on_signal: false     # 신호마다 알림은 끔
   notify_on_trade: true       # 체결 알림
   notify_on_error: true       # 오류 알림
-  daily_summary: true         # 일일 요약
+  daily_summary: true         # 일일 요약 (UTC 날짜가 바뀔 때 전일 요약 발송)
 
 # 백테스트
 backtest:

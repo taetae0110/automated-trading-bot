@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import stat
 from collections import Counter
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -21,6 +23,7 @@ from typing import Any
 import pandas as pd
 import pytest
 import yaml
+from dotenv import load_dotenv as real_load_dotenv
 from typer.testing import CliRunner
 
 from tradingbot import cli
@@ -263,10 +266,11 @@ def _date(dt: datetime) -> str:
 # ============================================================================ 픽스처
 @pytest.fixture(autouse=True)
 def _isolated_env(monkeypatch: pytest.MonkeyPatch):
-    """자격증명 없음 + 개발자의 .env 무시 + 로깅 핸들러 정리."""
+    """자격증명 없음 + 개발자의 .env 무시(config.py 기본 탐색과 CLI 의 프로젝트 .env 로더 모두) + 로깅 핸들러 정리."""
     for name in _CRED_ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr("tradingbot.config.load_dotenv", lambda *a, **k: False)
+    monkeypatch.setattr(cli, "load_dotenv", lambda *a, **k: False)
     cli._STATE["debug"] = False
     yield
     teardown_logging()
@@ -537,6 +541,152 @@ def test_validate_config_invalid_yaml_and_bad_date(invoke: Callable[..., Any], t
     assert result.exit_code == 1 and "backtest.start" in result.output
 
 
+def test_validate_config_rejects_unknown_keys(invoke: Callable[..., Any], tmp_path: Path) -> None:
+    """오타 난 키는 기본값으로 조용히 대체되지 않고 오류다 (config.py 모델은 extra='ignore' 라 CLI 가 거부한다).
+
+    risk.stop_loss_pc 같은 오타가 손절을 지우고, 그대로 '설정 OK' 와 함께 run(--live) 이 돌면 안 된다.
+    """
+    cfg = write_config(
+        tmp_path,
+        symbol=[ETH],  # symbols 오타 (최상위)
+        risk={"stop_loss_pc": 0.1, "trailing_stop": 0.05},  # risk.* 오타
+        risks={"max_positions": 1},  # 섹션 이름 오타
+        engine={"pollseconds": 5},
+        notify={"telegram": {"enable": True}},  # 중첩 모델 안의 오타
+    )
+    result = invoke("validate-config", "-c", str(cfg))
+    assert result.exit_code == 1, result.output
+    assert "[오류] ConfigError" in result.output and "알 수 없는 키가 6개" in result.output
+    assert "설정 OK" not in result.output and "Traceback" not in result.output
+    for unknown, suggestion in (
+        ("symbol", "symbols"),
+        ("risk.stop_loss_pc", "risk.stop_loss_pct"),
+        ("risk.trailing_stop", "risk.trailing_stop_pct"),
+        ("risks", "risk"),
+        ("engine.pollseconds", "engine.poll_seconds"),
+        ("notify.telegram.enable", "notify.telegram.enabled"),
+    ):
+        assert f"'{unknown}' (혹시 '{suggestion}'?)" in result.output
+
+    # 설정을 읽는 다른 명령도 같은 이유로 시작하지 않는다 (엔진이 기본 리스크 값으로 돌지 않음)
+    for args in (
+        ("run", "--once"),
+        ("backtest", "--source", "csv"),
+        ("download",),
+        ("status",),
+        ("balance",),
+    ):
+        result = invoke(args[0], "-c", str(cfg), *args[1:])
+        assert result.exit_code == 1 and "알 수 없는 키" in result.output, (args, result.output)
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_unknown_key_check_skips_free_form_sections(invoke: Callable[..., Any], tmp_path: Path) -> None:
+    """broker.extra / strategy.params 는 자유 형식이라 검사하지 않는다 (전략 파라미터 오타는 전략이 거부)."""
+    cfg = write_config(
+        tmp_path,
+        broker={"extra": {"jwt_algorithm": "HS256", "yf_symbols": {BTC: "BTC-USD"}}},
+        strategy={"name": "rsi", "params": {"period": 7, "oversold": 35, "overbought": 65}},
+    )
+    result = invoke("validate-config", "-c", str(cfg))
+    assert result.exit_code == 0, result.output
+    assert "알 수 없는 키" not in result.output
+    assert (
+        cli.find_unknown_keys({"broker": {"extra": {"anything": 1}}, "strategy": {"params": {"zzz": 1}}})
+        == []
+    )
+    assert cli.find_unknown_keys({"notify": {"slack": {"enabled": True, "url": "x"}}}) == [
+        "'notify.slack.url'"
+    ]
+    assert cli.find_unknown_keys({"risk": None, "logging": {"levl": "INFO"}}) == [
+        "'logging.levl' (혹시 'logging.level'?)"
+    ]
+    cfg2 = write_config(
+        tmp_path, name="p.yaml", strategy={"name": "sma_cross", "params": {"fasst": 5, "slow": 20}}
+    )
+    result = invoke("validate-config", "-c", str(cfg2))
+    assert result.exit_code == 1 and "fasst" in result.output
+
+
+def test_validate_config_warns_about_mode_backtest(invoke: Callable[..., Any], tmp_path: Path) -> None:
+    cfg = write_config(tmp_path, mode="backtest")
+    result = invoke("validate-config", "-c", str(cfg))
+    assert result.exit_code == 0, result.output
+    assert "[경고] mode=backtest" in result.output and "tradingbot backtest" in result.output
+
+
+def test_project_dotenv_is_loaded_from_cwd_or_config_dir(
+    invoke: Callable[..., Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLI 가 프로젝트 .env 를 읽는다: `init --dir DIR` 레이아웃(설정 파일 디렉터리의 상위) 과 현재 디렉터리.
+
+    config.py 의 load_dotenv() 기본 탐색은 패키지 디렉터리 기준이라 (픽스처가 꺼 둔 상태 그대로) 이 파일들을 보지 못한다.
+    """
+    monkeypatch.setattr(cli, "load_dotenv", real_load_dotenv)  # 픽스처가 꺼 둔 CLI 로더만 복원
+    keys = ("UPBIT_ACCESS_KEY", "UPBIT_SECRET_KEY")
+
+    def clear() -> None:
+        for k in keys:
+            os.environ.pop(k, None)
+
+    try:
+        # 1) init --dir 레이아웃: proj/config/config.yaml + proj/.env, 실행은 다른 디렉터리에서
+        proj = tmp_path / "proj"
+        (proj / "config").mkdir(parents=True)
+        cfg = write_config(tmp_path, name="proj/config/config.yaml")
+        (proj / ".env").write_text(
+            "UPBIT_ACCESS_KEY=dotenv-test-access\nUPBIT_SECRET_KEY=dotenv-test-secret\n", encoding="utf-8"
+        )
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        assert cli.find_project_dotenv(cfg) == proj / ".env"
+        result = invoke("validate-config", "-c", str(cfg))
+        assert result.exit_code == 0, result.output
+        assert (
+            "비어 있습니다" not in result.output
+        )  # 키를 읽었으므로 '환경변수 ... 가 비어 있습니다' 경고가 없다
+        assert "환경변수 파일" in result.output and "proj" in result.output
+        assert (
+            "dotenv-test-access" not in result.output and "dotenv-test-secret" not in result.output
+        )  # 값은 미출력
+        assert os.environ.get("UPBIT_ACCESS_KEY") == "dotenv-test-access"
+        clear()
+
+        # 2) 현재 디렉터리의 .env (설정 파일은 다른 곳)
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / ".env").write_text("UPBIT_ACCESS_KEY=cwd-test-access\n", encoding="utf-8")
+        (tmp_path / "cfgdir").mkdir()
+        cfg2 = write_config(tmp_path, name="cfgdir/c2.yaml")
+        monkeypatch.chdir(work)
+        assert cli.find_project_dotenv(cfg2) == work / ".env"
+        result = invoke("validate-config", "-c", str(cfg2))
+        assert result.exit_code == 0, result.output
+        assert os.environ.get("UPBIT_ACCESS_KEY") == "cwd-test-access"
+        assert (
+            "환경변수 UPBIT_SECRET_KEY 가 비어 있습니다" in result.output
+        )  # 읽힌 ACCESS_KEY 는 경고에서 빠진다
+        clear()
+
+        # 3) 이미 export 된 값이 우선한다 (override=False)
+        monkeypatch.setenv("UPBIT_ACCESS_KEY", "exported-wins")
+        result = invoke("validate-config", "-c", str(cfg2))
+        assert result.exit_code == 0, result.output
+        assert os.environ.get("UPBIT_ACCESS_KEY") == "exported-wins"
+        clear()
+
+        # 4) 아무 데도 없으면 경고 + 표에 '찾지 못함'
+        monkeypatch.chdir(elsewhere)
+        assert cli.find_project_dotenv(cfg2) is None
+        result = invoke("validate-config", "-c", str(cfg2))
+        assert result.exit_code == 0, result.output
+        assert "UPBIT_ACCESS_KEY, UPBIT_SECRET_KEY 가 비어 있습니다" in result.output
+        assert ".env 를 찾지 못함" in result.output
+    finally:
+        clear()
+
+
 # ============================================================================ init
 def test_init_creates_config_and_env(
     invoke: Callable[..., Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -582,6 +732,33 @@ def test_init_target_dir_and_missing_templates(
     result = invoke("init", "--dir", str(tmp_path / "other"))
     assert result.exit_code == 1
     assert "예시 파일" in result.output
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX 파일 권한")
+def test_init_creates_env_file_owner_only(
+    invoke: Callable[..., Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """.env 에는 API 키가 들어가므로 umask 와 무관하게 0600 으로 만든다 (KIS 토큰 캐시와 같은 기준). --force 뒤에도 0600."""
+    monkeypatch.chdir(tmp_path)
+    old_umask = os.umask(0o022)
+    try:
+        result = invoke("init")
+        assert result.exit_code == 0, result.output
+        env = tmp_path / ".env"
+        assert stat.S_IMODE(env.stat().st_mode) == 0o600
+        assert env.read_text(encoding="utf-8") == (ROOT / ".env.example").read_text(encoding="utf-8")
+        assert "권한 600" in result.output
+        # 비밀이 없는 설정 파일은 umask 기본 권한
+        assert stat.S_IMODE((tmp_path / "config" / "config.yaml").stat().st_mode) == 0o644
+
+        env.chmod(0o644)
+        env.write_text("UPBIT_ACCESS_KEY=old\n", encoding="utf-8")
+        result = invoke("init", "--force")
+        assert result.exit_code == 0, result.output
+        assert stat.S_IMODE(env.stat().st_mode) == 0o600
+        assert env.read_text(encoding="utf-8") == (ROOT / ".env.example").read_text(encoding="utf-8")
+    finally:
+        os.umask(old_umask)
 
 
 # ============================================================================ backtest
@@ -1052,6 +1229,23 @@ def test_run_rejects_paper_broker_name(invoke: Callable[..., Any], tmp_path: Pat
     result = invoke("run", "-c", str(cfg), "--once")
     assert result.exit_code == 1
     assert "시세 출처" in result.output
+
+
+def test_run_refuses_mode_backtest(
+    invoke: Callable[..., Any],
+    tmp_path: Path,
+    feed: RealFeedBroker,
+    patch_broker: Callable[[BaseBroker], list[str]],
+) -> None:
+    """mode: backtest 는 엔진에 의미가 없다 (is_live 만 봄) — 조용히 실시간 paper 루프로 내려가지 않고 거부한다."""
+    names = patch_broker(feed)
+    cfg = write_config(tmp_path, mode="backtest")
+    result = invoke("run", "-c", str(cfg), "--once")
+    assert result.exit_code == 1, result.output
+    assert "[오류] ConfigError" in result.output and "tradingbot backtest" in result.output
+    assert "모의투자(paper)" not in result.output
+    assert names == [] and feed.calls["get_candles"] == 0  # 브로커/엔진을 만들지 않았다
+    assert not (tmp_path / "state.json").exists()
 
 
 def test_run_once_paper_mode_writes_state_then_status_and_balance(

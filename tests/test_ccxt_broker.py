@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import math
 import types
 from datetime import datetime, timedelta, timezone
@@ -22,9 +23,12 @@ from freezegun import freeze_time
 from tradingbot.brokers import create_broker, get_broker_class
 from tradingbot.brokers.ccxt_broker import (
     CCXT_INSTALL_HINT,
+    DEFAULT_EXCHANGE_OPTIONS,
     DEFAULT_QUOTE_CURRENCIES,
+    MARKET_BUY_REQUIRES_PRICE_OPTION,
     TIMEFRAMES,
     CCXTBroker,
+    is_market_buy_price_error,
     split_symbol,
     to_ccxt_timeframe,
     translate_ccxt_error,
@@ -120,9 +124,22 @@ class FakeExchange:
         batch_cap: int | None = None,
         options: dict[str, Any] | None = None,
         sandbox_error: Exception | None = None,
+        require_market_buy_price: bool = False,
     ) -> None:
         self.id = exchange_id
-        self.options: dict[str, Any] = dict(options or {})
+        # 실제 ccxt.binance 기본 옵션 중 어댑터 동작에 영향을 주는 것: 심볼 없는 fetch_open_orders 경고 (ccxt 4.5).
+        # ``options`` 는 거래소 인스턴스가 이미 가진 옵션을 흉내낸다 (어댑터의 ``options=`` 와 구분).
+        self.options: dict[str, Any] = (
+            {"fetchOpenOrders": {"warnWithoutSymbol": True}} if exchange_id == "binance" else {}
+        )
+        for key, value in (options or {}).items():
+            if isinstance(value, dict) and isinstance(self.options.get(key), dict):
+                self.options[key].update(value)
+            else:
+                self.options[key] = value
+        #: btse 처럼 거래소 코드에 ``createMarketBuyOrderRequiresPrice`` 기본값 True 가 박혀 있어
+        #: 옵션에는 나타나지 않지만 price 없는 시장가 매수를 요청 전에 거부하는 거래소를 흉내낸다.
+        self.require_market_buy_price = require_market_buy_price
         self.ohlcv = sorted(ohlcv, key=lambda r: r[0])
         self._markets_data = markets if markets is not None else MARKETS
         self.markets: dict[str, Any] | None = None
@@ -160,6 +177,14 @@ class FakeExchange:
         if self.sandbox_error is not None:
             raise self.sandbox_error
         self.sandbox_calls.append(enabled)
+
+    def handle_option(self, method_name: str, option_name: str, default: Any = None) -> Any:
+        """ccxt ``Exchange.handle_option`` 과 같은 순서: options[method][opt] → options[opt] → default."""
+        scoped = self.options.get(method_name)
+        value = scoped.get(option_name) if isinstance(scoped, dict) else None
+        if value is None:
+            value = self.options.get(option_name)
+        return default if value is None else value
 
     def load_markets(self, reload: bool = False, params: dict[str, Any] | None = None) -> dict[str, Any]:
         if "load_markets" in self.fail:
@@ -235,6 +260,19 @@ class FakeExchange:
     ) -> dict[str, Any]:
         self._record("create_order", symbol, type, side, amount, price, dict(params or {}))
         market = self._market(symbol)
+        if (
+            self.require_market_buy_price
+            and type == "market"
+            and side == "buy"
+            and price is None
+            and (params or {}).get("quoteOrderQty") is None
+        ):
+            # ccxt 4.5 btse.create_order 가 요청을 보내기 전에 던지는 메시지 원문
+            raise ccxt.InvalidOrder(
+                f"{self.id} createOrder() requires the price argument for market buy orders to calculate the "
+                "total cost to spend, alternatively set the createMarketBuyOrderRequiresPrice option or param "
+                "to False and pass the cost to spend in the amount argument"
+            )
         self._seq += 1
         order_id = str(1000 + self._seq)
         ts = int(self.ohlcv[-1][0])
@@ -325,6 +363,18 @@ class FakeExchange:
         params: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         self._record("fetch_open_orders", symbol)
+        if symbol is None and self.id == "binance":
+            # ccxt 4.5 binance.fetch_open_orders 의 사전 검사 (옵션 신·구 표기 모두 확인)
+            nested = self.options.get("fetchOpenOrders")
+            warn = nested.get("warnWithoutSymbol") if isinstance(nested, dict) else None
+            legacy = self.options.get("warnOnFetchOpenOrdersWithoutSymbol")
+            if legacy is True or (legacy is None and warn is True):
+                raise ccxt.ExchangeError(
+                    f"{self.id} fetchOpenOrders() WARNING: fetching open orders without specifying a symbol has "
+                    "stricter rate limits (10 times more for spot, 40 times more for other markets) compared to "
+                    f"requesting with symbol argument. To acknowledge self warning, set {self.id}.options"
+                    '["fetchOpenOrders"]["warnWithoutSymbol"] = False to suppress self warning message.'
+                )
         return [
             dict(o)
             for o in self.orders.values()
@@ -423,15 +473,24 @@ class TestConstruction:
                 "apiKey": API_KEY,
                 "secret": SECRET,
                 "password": "pass",
-                "options": {"defaultType": "spot"},
+                "options": {**DEFAULT_EXCHANGE_OPTIONS, "defaultType": "spot"},
             }
         ]
         assert b.exchange.options["sandboxMode"] is True
         assert b.has_credentials
 
-        # 키 없이 생성 가능 (공개 시세용)
+        # 키 없이 생성 가능 (공개 시세용). 어댑터 기본 옵션은 항상 넘기되 모듈 상수는 공유하지 않는다
         CCXTBroker("binance")
-        assert created[-1] == {"enableRateLimit": True}
+        assert created[-1] == {"enableRateLimit": True, "options": DEFAULT_EXCHANGE_OPTIONS}
+        assert created[-1]["options"] is not DEFAULT_EXCHANGE_OPTIONS
+        assert created[-1]["options"]["fetchOpenOrders"] is not DEFAULT_EXCHANGE_OPTIONS["fetchOpenOrders"]
+
+        # 사용자 옵션이 기본 옵션을 덮어쓰며 중첩 dict 는 깊은 병합된다
+        CCXTBroker("binance", options={"fetchOpenOrders": {"warnWithoutSymbol": True, "limit": 10}})
+        assert created[-1]["options"] == {
+            "warnOnFetchOpenOrdersWithoutSymbol": False,
+            "fetchOpenOrders": {"warnWithoutSymbol": True, "limit": 10},
+        }
 
         with pytest.raises(ConfigError):
             CCXTBroker("nonexistent-exchange")
@@ -440,24 +499,53 @@ class TestConstruction:
 
     def test_sandbox_mode_guarded(self, ohlcv: list[list[float]]) -> None:
         ok = FakeExchange(ohlcv)
-        CCXTBroker("binance", exchange=ok, sandbox=True)
+        b = CCXTBroker("binance", exchange=ok, sandbox=True)
         assert ok.sandbox_calls == [True]
-
-        unsupported = FakeExchange(
-            ohlcv, sandbox_error=ccxt.NotSupported("bithumb does not have a sandbox URL")
-        )
-        b = CCXTBroker("bithumb", exchange=unsupported, sandbox=True)  # 예외 없이 경고만
         assert b.sandbox is True
-        assert unsupported.sandbox_calls == []
 
         no_sandbox = FakeExchange(ohlcv)
         CCXTBroker("binance", exchange=no_sandbox, sandbox=False)
         assert no_sandbox.sandbox_calls == []
 
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ccxt.NotSupported("bithumb does not have a sandbox URL"),  # urls["test"] 키 자체가 없는 거래소
+            TypeError(
+                "'NoneType' object is not iterable"
+            ),  # ccxt 4.5: urls["test"] 가 None 인 거래소 (bithumb 등 54곳)
+        ],
+    )
+    def test_sandbox_unsupported_fails_closed(self, ohlcv: list[list[float]], error: Exception) -> None:
+        """샌드박스를 요청했는데 켤 수 없으면 실전 서버로 조용히 내려가지 않고 생성을 거부한다 (ConfigError)."""
+        unsupported = FakeExchange(ohlcv, exchange_id="bithumb", sandbox_error=error)
+        with pytest.raises(ConfigError) as ei:
+            CCXTBroker("bithumb", exchange=unsupported, sandbox=True)
+        assert "bithumb" in str(ei.value)
+        assert "sandbox: false" in str(ei.value)
+        assert type(error).__name__ in str(ei.value)
+        assert ei.value.__cause__ is error
+        assert unsupported.sandbox_calls == []
+        # sandbox=False 로 명시하면 그대로 생성된다
+        explicit = FakeExchange(ohlcv, exchange_id="bithumb", sandbox_error=error)
+        assert CCXTBroker("bithumb", exchange=explicit, sandbox=False).sandbox is False
+
     def test_options_merged_into_injected_exchange(self, ohlcv: list[list[float]]) -> None:
-        ex = FakeExchange(ohlcv, options={"a": 1})
-        CCXTBroker("binance", exchange=ex, options={"b": 2})
-        assert ex.options == {"a": 1, "b": 2}
+        ex = FakeExchange(ohlcv, options={"a": 1, "createOrder": {"timeInForce": "GTC"}})
+        CCXTBroker("binance", exchange=ex, options={"b": 2, "createOrder": {"quoteOrderQty": True}})
+        # 어댑터 기본 옵션 + 사용자 옵션을 깊은 병합 (중첩 dict 의 기존 키 유지)
+        assert ex.options == {
+            "a": 1,
+            "b": 2,
+            "createOrder": {"timeInForce": "GTC", "quoteOrderQty": True},
+            "fetchOpenOrders": {"warnWithoutSymbol": False},
+            "warnOnFetchOpenOrdersWithoutSymbol": False,
+        }
+        # 사용자 옵션은 어댑터 기본 옵션보다 우선한다
+        keep = FakeExchange(ohlcv)
+        CCXTBroker("binance", exchange=keep, options={"warnOnFetchOpenOrdersWithoutSymbol": True})
+        assert keep.options["warnOnFetchOpenOrdersWithoutSymbol"] is True
+        assert keep.options["fetchOpenOrders"] == {"warnWithoutSymbol": False}
 
     def test_close_delegates(self, broker: CCXTBroker, fake: FakeExchange) -> None:
         broker.close()
@@ -513,7 +601,10 @@ class TestFromConfig:
         b = create_broker("binance", cfg)
         assert isinstance(b, CCXTBroker)
         assert b.exchange_id == "binance"
-        assert stub_ccxt[-1] == ("binance", {"enableRateLimit": True, "apiKey": "bk", "secret": "bs"})
+        assert stub_ccxt[-1] == (
+            "binance",
+            {"enableRateLimit": True, "apiKey": "bk", "secret": "bs", "options": DEFAULT_EXCHANGE_OPTIONS},
+        )
         assert b.exchange.sandbox == []
 
     def test_ccxt_name_with_exchange_id_and_options(
@@ -536,7 +627,7 @@ class TestFromConfig:
                 "apiKey": "k",
                 "secret": "s",
                 "password": "p",
-                "options": {"defaultType": "spot"},
+                "options": {**DEFAULT_EXCHANGE_OPTIONS, "defaultType": "spot"},
             },
         )
         assert b.exchange.sandbox == [True]
@@ -548,7 +639,20 @@ class TestFromConfig:
         b = CCXTBroker.from_config(cfg)
         assert b.exchange_id == "binance"
         assert not b.has_credentials
-        assert stub_ccxt[-1] == ("binance", {"enableRateLimit": True})
+        assert stub_ccxt[-1] == ("binance", {"enableRateLimit": True, "options": DEFAULT_EXCHANGE_OPTIONS})
+
+    def test_sandbox_without_testnet_refused_via_real_ccxt(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """설정 기본값 sandbox=true + 테스트넷 없는 거래소 → 실전 서버로 내려가지 않고 ConfigError (네트워크 없음)."""
+        cfg = AppConfig(broker=BrokerConfig(name="ccxt", exchange_id="bithumb"))
+        assert cfg.broker.sandbox is True  # 기본값
+        with pytest.raises(ConfigError) as ei:
+            CCXTBroker.from_config(cfg)
+        assert "bithumb" in str(ei.value) and "sandbox: false" in str(ei.value)
+        live = CCXTBroker.from_config(
+            AppConfig(broker=BrokerConfig(name="ccxt", exchange_id="bithumb", sandbox=False))
+        )
+        assert live.sandbox is False
+        assert live.exchange.urls["api"] == ccxt.bithumb().urls["api"]
 
     def test_other_name_used_as_exchange_id(self, stub_ccxt: list[tuple[str, dict[str, Any]]]) -> None:
         cfg = AppConfig(broker=BrokerConfig(name="bybit", sandbox=False))
@@ -1042,6 +1146,98 @@ class TestPlaceOrder:
         b.place_order(SYMBOL, OrderSide.SELL, 0.01)
         assert fake.calls[-1][1] == (SYMBOL, "market", "sell", 0.01, None, {})
 
+    def test_market_buy_option_resolved_like_ccxt(self, ohlcv: list[list[float]]) -> None:
+        """bitget/bigone/bittrade 처럼 ``options["createOrder"]`` 안에만 True 가 있는 거래소: 첫 시도부터 price 를 넘긴다."""
+        nested = {"createOrder": {MARKET_BUY_REQUIRES_PRICE_OPTION: True}}
+        fake = FakeExchange(ohlcv, exchange_id="bitget", options=nested)
+        b = CCXTBroker("bitget", API_KEY, SECRET, exchange=fake)
+        assert b._market_buy_requires_price() is True
+        order = b.place_order(SYMBOL, OrderSide.BUY, 0.01)
+        creates = [c for c in fake.calls if c[0] == "create_order"]
+        assert len(creates) == 1
+        assert creates[0][1] == (SYMBOL, "market", "buy", 0.01, fake.last_close, {})
+        assert order.status == OrderStatus.FILLED
+
+        # 중첩 키가 최상위 키보다 우선 (bybit: createOrder.createMarketBuyOrderRequiresPrice=False)
+        both = {
+            "createOrder": {MARKET_BUY_REQUIRES_PRICE_OPTION: False},
+            MARKET_BUY_REQUIRES_PRICE_OPTION: True,
+        }
+        b2 = CCXTBroker(
+            "bybit", API_KEY, SECRET, exchange=FakeExchange(ohlcv, exchange_id="bybit", options=both)
+        )
+        assert b2._market_buy_requires_price() is False
+
+        # handle_option 이 없는 주입 객체도 같은 순서(중첩 → 최상위) 로 읽는다
+        plain = FakeExchange(ohlcv, exchange_id="bitget", options=nested)
+        plain.handle_option = None  # type: ignore[assignment]
+        assert CCXTBroker("bitget", API_KEY, SECRET, exchange=plain)._market_buy_requires_price() is True
+        top_only = FakeExchange(ohlcv, exchange_id="upbit", options={MARKET_BUY_REQUIRES_PRICE_OPTION: True})
+        top_only.handle_option = None  # type: ignore[assignment]
+        assert CCXTBroker("upbit", API_KEY, SECRET, exchange=top_only)._market_buy_requires_price() is True
+        neither = FakeExchange(ohlcv, exchange_id="kucoin")
+        neither.handle_option = None  # type: ignore[assignment]
+        assert CCXTBroker("kucoin", API_KEY, SECRET, exchange=neither)._market_buy_requires_price() is False
+
+    def test_market_buy_retries_with_ticker_when_ccxt_demands_price(self, ohlcv: list[list[float]]) -> None:
+        """btse 처럼 옵션 없이 코드 기본값이 True 인 거래소: ccxt 가 요청 전에 거부하면 현재가로 한 번 재시도한다."""
+        fake = FakeExchange(ohlcv, exchange_id="btse", require_market_buy_price=True)
+        b = CCXTBroker("btse", API_KEY, SECRET, exchange=fake)
+        assert b._market_buy_requires_price() is False  # 옵션으로는 알 수 없다
+        order = b.place_order(SYMBOL, OrderSide.BUY, 0.01)
+        names = [c[0] for c in fake.calls]
+        assert names.count("create_order") == 2
+        assert names.count("fetch_ticker") == 1
+        assert names.index("fetch_ticker") > names.index("create_order")  # 거부를 본 뒤에야 현재가를 조회
+        creates = [c[1] for c in fake.calls if c[0] == "create_order"]
+        assert creates[0] == (SYMBOL, "market", "buy", 0.01, None, {})
+        assert creates[1] == (SYMBOL, "market", "buy", 0.01, fake.last_close, {})
+        assert order.status == OrderStatus.FILLED
+        assert order.filled_quantity == pytest.approx(0.01)
+        # 매도는 영향 없음
+        b.place_order(SYMBOL, OrderSide.SELL, 0.01)
+        assert fake.calls[-1][1] == (SYMBOL, "market", "sell", 0.01, None, {})
+
+    def test_market_buy_price_error_retried_once_only(self, ohlcv: list[list[float]]) -> None:
+        fake = FakeExchange(ohlcv, exchange_id="btse")
+        demand = ccxt.InvalidOrder(
+            "btse createOrder() requires the price argument for market buy orders to calculate the total cost "
+            "to spend, alternatively set the createMarketBuyOrderRequiresPrice option or param to False and "
+            "pass the cost to spend in the amount argument"
+        )
+        fake.fail["create_order"] = demand
+        b = CCXTBroker("btse", API_KEY, SECRET, exchange=fake)
+        with pytest.raises(OrderError) as ei:
+            b.place_order(SYMBOL, OrderSide.BUY, 0.01)
+        assert ei.value.__cause__ is demand
+        assert [c[0] for c in fake.calls].count("create_order") == 2
+        # 다른 InvalidOrder 는 재시도하지 않는다
+        fake.calls.clear()
+        fake.fail["create_order"] = ccxt.InvalidOrder("Filter failure: MIN_NOTIONAL")
+        with pytest.raises(OrderError):
+            b.place_order(SYMBOL, OrderSide.BUY, 0.01)
+        assert [c[0] for c in fake.calls].count("create_order") == 1
+        assert not any(c[0] == "fetch_ticker" for c in fake.calls)
+
+    def test_is_market_buy_price_error(self) -> None:
+        bitget = (
+            "bitget createOrder() requires the price argument for market buy orders to calculate the total cost "
+            "to spend (amount * price), alternatively set the createMarketBuyOrderRequiresPrice option or param to "
+            "false and pass the cost to spend in the amount argument"
+        )
+        assert is_market_buy_price_error(ccxt.InvalidOrder(bitget))
+        assert is_market_buy_price_error(OrderError(f"InvalidOrder: {bitget}"))
+        assert is_market_buy_price_error(
+            ccxt.InvalidOrder(
+                "htx createOrder() requires the price and amount argument for market buy orders"
+            )
+        )
+        assert not is_market_buy_price_error(
+            ccxt.InvalidOrder("okx createOrder() requires a price argument for limit")
+        )
+        assert not is_market_buy_price_error(ccxt.InvalidOrder("Filter failure: MIN_NOTIONAL"))
+        assert not is_market_buy_price_error(ccxt.InsufficientFunds("insufficient"))
+
     def test_limit_order_rounds_amount_and_price(self, broker: CCXTBroker, fake: FakeExchange) -> None:
         order = broker.place_order(SYMBOL, OrderSide.BUY, 0.123456789, OrderType.LIMIT, price=12345.678)
         assert fake.calls[-1][1] == (SYMBOL, "limit", "buy", 0.12345, 12345.68, {})
@@ -1110,6 +1306,25 @@ class TestOrderLifecycle:
         # 이미 종료된 주문 재취소 / 없는 주문 → False
         assert broker.cancel_order(o1.id, SYMBOL) is False
         assert broker.cancel_order("does-not-exist", SYMBOL) is False
+
+    def test_open_orders_without_symbol_guard_disabled_by_default(self, ohlcv: list[list[float]]) -> None:
+        """Binance 의 심볼 생략 경고(요청 전 ExchangeError) 를 어댑터가 기본으로 해제해 BaseBroker 계약을 지킨다."""
+        fake = FakeExchange(ohlcv)
+        assert fake.options["fetchOpenOrders"]["warnWithoutSymbol"] is True  # ccxt.binance 기본값
+        b = CCXTBroker("binance", API_KEY, SECRET, exchange=fake)
+        o = b.place_order(SYMBOL, OrderSide.BUY, 0.01, OrderType.LIMIT, price=1000.0)
+        assert [x.id for x in b.get_open_orders()] == [o.id]
+        assert fake.calls[-1] == ("fetch_open_orders", (None,), {})
+
+        # 호출자가 경고를 다시 켜면 ccxt 의 거부가 그대로 BrokerError 로 올라온다 (심볼 지정은 영향 없음)
+        strict = FakeExchange(ohlcv)
+        sb = CCXTBroker(
+            "binance", API_KEY, SECRET, exchange=strict, options={"warnOnFetchOpenOrdersWithoutSymbol": True}
+        )
+        with pytest.raises(BrokerError) as ei:
+            sb.get_open_orders()
+        assert "warnWithoutSymbol" in str(ei.value)
+        assert sb.get_open_orders(SYMBOL) == []
 
     def test_cancel_other_invalid_order_raises(self, broker: CCXTBroker, fake: FakeExchange) -> None:
         fake.fail["cancel_order"] = ccxt.InvalidOrder("cannot cancel")
@@ -1334,3 +1549,91 @@ class TestRealCcxtInstance:
     def test_real_timeframes_supported(self, real_exchange: Any) -> None:
         assert all(tf in real_exchange.timeframes for tf in TIMEFRAMES.values())
         assert "10m" not in real_exchange.timeframes
+
+    @staticmethod
+    def _offline(ex: Any, monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, str]]:
+        """HTTP 계층(``Exchange.fetch``) 을 가로채 요청만 기록하고 NetworkError 를 던진다."""
+        seen: list[tuple[str, str, str]] = []
+
+        def fetch(url: str, method: str = "GET", headers: Any = None, body: Any = None) -> Any:
+            seen.append((method, url, body or ""))
+            raise ccxt.NetworkError("offline")
+
+        monkeypatch.setattr(ex, "fetch", fetch)
+        return seen
+
+    def test_real_option_resolution_matches_ccxt(self) -> None:
+        """``_market_buy_requires_price`` 는 ccxt ``handle_option`` 과 같은 값을 낸다 (중첩/최상위/없음)."""
+        expected = {"bitget": True, "bigone": True, "bittrade": True, "upbit": True, "bithumb": True}
+        expected.update({"bybit": False, "okx": False, "binance": False, "kucoin": False, "btse": False})
+        for exchange_id, want in expected.items():
+            ex = getattr(ccxt, exchange_id)()
+            b = CCXTBroker(exchange_id, API_KEY, SECRET, exchange=ex)
+            assert b._market_buy_requires_price() is want, exchange_id
+            assert b._market_buy_requires_price() == bool(
+                ex.handle_option("createOrder", MARKET_BUY_REQUIRES_PRICE_OPTION, False)
+            )
+
+    @pytest.mark.parametrize(("exchange_id", "cost_key"), [("bitget", "size"), ("btse", "quoteOrderSize")])
+    def test_real_market_buy_reaches_http_with_quote_cost(
+        self, exchange_id: str, cost_key: str, ohlcv: list[list[float]], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """실제 ccxt 거래소 클래스: ccxt 의 사전 거부('requires the price argument') 없이 총액 환산 주문이 HTTP 까지 간다.
+
+        bitget 은 중첩 옵션(True) 으로 바로, btse 는 코드 기본값(True) 이라 재시도로 price 가 채워진다.
+        """
+        ex = getattr(ccxt, exchange_id)({"apiKey": API_KEY, "secret": SECRET, "password": "p"})
+        ex.set_markets(MARKETS)
+        fake = FakeExchange(ohlcv)
+        fake.markets = {k: dict(v) for k, v in MARKETS.items()}
+        monkeypatch.setattr(ex, "fetch_ticker", fake.fetch_ticker)
+        seen = self._offline(ex, monkeypatch)
+        b = CCXTBroker(exchange_id, API_KEY, SECRET, "p", exchange=ex)
+        with pytest.raises(BrokerError) as ei:
+            b.place_order(SYMBOL, OrderSide.BUY, 0.01)
+        assert not isinstance(ei.value, OrderError)
+        assert "offline" in str(ei.value)
+        posts = [s for s in seen if s[0] == "POST"]
+        assert len(posts) == 1
+        body = json.loads(posts[0][2])
+        assert float(body[cost_key]) == pytest.approx(0.01 * fake.last_close, abs=0.01)
+
+    def test_real_binance_open_orders_without_symbol_reaches_http(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        assert (
+            ccxt.binance().options["fetchOpenOrders"]["warnWithoutSymbol"] is True
+        )  # ccxt 기본값: 요청 전 거부
+        ex = ccxt.binance({"apiKey": API_KEY, "secret": SECRET})
+        ex.set_markets(MARKETS)
+        seen = self._offline(ex, monkeypatch)
+        b = CCXTBroker("binance", API_KEY, SECRET, exchange=ex)
+        with pytest.raises(BrokerError) as ei:
+            b.get_open_orders()
+        assert "offline" in str(ei.value)
+        assert seen and "/openOrders" in seen[-1][1]
+        # _create_exchange 경로: 기본 옵션이 들어가고 ccxt 의 다른 기본 옵션(createOrder 등) 은 그대로
+        created = CCXTBroker("binance").exchange
+        assert created.options["fetchOpenOrders"]["warnWithoutSymbol"] is False
+        assert created.options["warnOnFetchOpenOrdersWithoutSymbol"] is False
+        fresh = ccxt.binance().options
+        assert {k: v for k, v in fresh.items() if k != "fetchOpenOrders"} == {
+            k: v for k, v in created.options.items() if k not in DEFAULT_EXCHANGE_OPTIONS
+        }
+
+    @pytest.mark.parametrize("exchange_id", ["bithumb", "upbit", "kraken", "kucoin", "bitstamp"])
+    def test_real_exchange_without_testnet_refuses_sandbox(self, exchange_id: str) -> None:
+        """ccxt 4.5: ``urls["test"]`` 가 None 인 거래소는 set_sandbox_mode 가 TypeError 로 실패하며 실전 URL 이 남는다."""
+        production = getattr(ccxt, exchange_id)().urls["api"]
+        with pytest.raises(ConfigError) as ei:
+            CCXTBroker(exchange_id, API_KEY, SECRET, sandbox=True)
+        assert exchange_id in str(ei.value)
+        explicit = CCXTBroker(exchange_id, API_KEY, SECRET, sandbox=False)
+        assert explicit.exchange.urls["api"] == production
+
+    def test_real_binance_sandbox_switches_to_testnet(self) -> None:
+        b = CCXTBroker("binance", API_KEY, SECRET, sandbox=True)
+        assert b.sandbox is True
+        assert b.exchange.isSandboxModeEnabled is True
+        assert b.exchange.urls["api"] == ccxt.binance().urls["test"]
+        assert b.exchange.urls["api"] != ccxt.binance().urls["api"]

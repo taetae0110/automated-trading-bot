@@ -49,6 +49,11 @@ class VolatilityBreakoutStrategy(BaseStrategy):
         # 필터 없음: 완성 캔들 1개면 range 를 구할 수 있다. 필터 있음: SMA 유효 행(ma_period-1) + 여유 1.
         return self.ma_period + 1 if self.ma_period > 0 else 1
 
+    @property
+    def recommended_candles(self) -> int:
+        """실시간 엔진이 넘겨야 할 캔들 수 권장치. range 와 SMA 필터는 창 밖의 과거를 보지 않으므로 warmup 과 같다."""
+        return self.warmup
+
     def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
         missing = [c for c in _REQUIRED_INPUT if c not in df.columns]
         if missing:

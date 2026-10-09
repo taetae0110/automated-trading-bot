@@ -5,7 +5,7 @@ Python 자동매매 봇입니다. **백테스트 → 모의투자(paper) → 실
 
 - 전략: SMA/EMA 교차, RSI, 볼린저 밴드, MACD, 변동성 돌파 (+ 직접 추가)
 - 리스크: 종목당 비중, 최대 종목 수, 손절/익절/추적손절, 일일 손실 한도, 운용 자금 상한
-- 백테스터: bar 단위 재생, 다음 캔들 시가 체결, 수수료/슬리피지, STOP 주문 흉내, 18개 성과 지표, JSON/CSV 리포트
+- 백테스터: bar 단위 재생, 다음 캔들 시가 체결, 수수료/슬리피지, STOP 주문 흉내, 19개 성과 지표, JSON/CSV 리포트
 - 실시간 엔진: 캔들 폴링, 체결 확인, 상태 파일(원자적 저장) 로 재시작 복원, 텔레그램/슬랙/디스코드 알림
 - 모든 시세는 **실제 거래소 데이터** 입니다. 샘플/데모 데이터는 어디에도 없습니다.
 
@@ -55,7 +55,7 @@ tradingbot init
 # 2. .env 에 사용할 거래소의 키를 넣는다 (Upbit/Binance 의 시세·백테스트·모의투자는 키 없이도 동작)
 #    UPBIT_ACCESS_KEY=...  UPBIT_SECRET_KEY=...
 
-# 3. 설정 검증 (브로커/전략/간격/리스크 값, 환경변수 유무)
+# 3. 설정 검증 (브로커/전략/간격/리스크 값, 모르는 키·오타, 환경변수 유무와 읽은 .env 경로)
 tradingbot validate-config -c config/config.yaml
 
 # 4. 실제 캔들 내려받기 (data/candles/upbit/KRW-BTC_1h.csv 에 캐시)
@@ -83,8 +83,8 @@ tradingbot balance -c config/config.yaml --live  # 실제 계좌 조회
 
 | 명령 | 설명 |
 |---|---|
-| `tradingbot init [--force] [--dir DIR]` | `config/config.example.yaml` → `config/config.yaml`, `.env.example` → `.env` 복사 (있으면 건너뜀) |
-| `tradingbot validate-config -c CFG` | 설정 검증. 오류면 종료 코드 1, 경고는 출력만 |
+| `tradingbot init [--force] [--dir DIR]` | `config/config.example.yaml` → `config/config.yaml`, `.env.example` → `.env` 복사 (있으면 건너뜀). `.env` 는 소유자만 읽을 수 있게(권한 600) 생성 |
+| `tradingbot validate-config -c CFG` | 설정 검증 (모르는 키·오타는 오류). 오류면 종료 코드 1, 경고는 출력만. 어떤 `.env` 를 읽었는지 표시 |
 | `tradingbot strategies` / `brokers` | 전략 목록(기본 파라미터, 워밍업) / 브로커 목록(환경변수, 지원 간격) |
 | `tradingbot download -c CFG [--symbol S ...] [--start D] [--end D] [--interval I] [--source broker\|yfinance]` | 실제 캔들을 `backtest.data_dir` 에 CSV 로 캐시 (기본 365일 전부터) |
 | `tradingbot backtest -c CFG [--symbol S ...] [--strategy NAME] [-p k=v ...] [--start D --end D] [--interval I] [--source auto\|csv\|broker\|yfinance] [--cash N] [--fill-on next_open\|close] [--report] [--report-dir DIR] [--trades N]` | 백테스트. `auto` 는 캐시가 구간을 덮으면 csv, 아니면 거래소 다운로드(키 없는 주식 브로커는 yfinance) |
@@ -100,10 +100,12 @@ tradingbot balance -c config/config.yaml --live  # 실제 계좌 조회
 ## 설정 파일 (`config/config.yaml`)
 
 모든 키에 한국어 주석이 달린 `config/config.example.yaml` 을 기준으로 설명합니다. 비율은 전부 0~1 소수입니다 (0.02 = 2%).
+표에 없는 키(오타, 잘못된 섹션) 는 기본값으로 조용히 대체되지 않고 `validate-config`/`run`/`backtest` 가 **오류로 거부** 합니다
+(`strategy.params`, `broker.extra` 안은 자유 형식).
 
 | 섹션 / 키 | 기본값 | 설명 |
 |---|---|---|
-| `mode` | `paper` | `backtest` \| `paper` \| `live`. `live` 는 `broker.name` 이 `paper` 면 안 되고 `run --live` 로만 시작 |
+| `mode` | `paper` | `paper` \| `live`. `live` 는 `broker.name` 이 `paper` 면 안 되고 `run --live` 로만 시작. `backtest` 값도 읽히지만 `run` 이 거부하며, `tradingbot backtest` 명령은 `mode` 와 무관 |
 | `broker.name` | `upbit` | `upbit` \| `binance` \| `ccxt` \| `kis` \| `alpaca` (시세 출처 겸 실거래 브로커) |
 | `broker.exchange_id` | `null` | ccxt 전용 거래소 id (`bybit`, `okx`, `bithumb` …). `binance` 면 자동 |
 | `broker.sandbox` | `true` | KIS 모의투자 서버 / Alpaca paper-api / ccxt 테스트넷. paper·backtest·download 에서 ccxt 는 자동으로 실제 시세 사용 |
@@ -131,7 +133,7 @@ tradingbot balance -c config/config.yaml --live  # 실제 계좌 조회
 | `engine.stale_data_minutes` | `30` | 마지막 완성 캔들이 이보다 오래되면 경고 (일봉은 1500 정도) |
 | `notify.telegram/slack/discord.enabled` | `false` | 채널 사용 여부. 토큰/웹훅은 `.env` |
 | `notify.notify_on_signal/trade/error` | `false/true/true` | 신호/체결/오류 알림 |
-| `notify.daily_summary` | `true` | UTC 날짜가 바뀔 때 일일 요약 |
+| `notify.daily_summary` | `true` | UTC 날짜가 바뀔 때 일일 요약 (= 09:00 KST, 국내주식은 다음 거래일 개장 시점에 전일 요약) |
 | `backtest.start` / `backtest.end` | `null` | 기본 백테스트 구간 (`YYYY-MM-DD`, 양끝 포함) |
 | `backtest.data_dir` | `data/candles` | 캔들 CSV 캐시 위치 (`{data_dir}/{broker}/{symbol}_{interval}.csv`) |
 | `backtest.initial_cash` / `fee_pct` / `slippage_pct` | `10000000` / `0.0005` / `0.0005` | 백테스트 계좌 |
@@ -145,9 +147,14 @@ tradingbot balance -c config/config.yaml --live  # 실제 계좌 조회
 |---|---|
 | `UPBIT_ACCESS_KEY`, `UPBIT_SECRET_KEY` | Upbit 잔고/주문 |
 | `CCXT_API_KEY`, `CCXT_SECRET`, `CCXT_PASSWORD` (별칭 `BINANCE_API_KEY`, `BINANCE_SECRET_KEY`) | ccxt 거래소 |
-| `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_ACCOUNT_NO` (`12345678-01`), `KIS_HTS_ID` | 한국투자증권 (시세 포함) |
+| `KIS_APP_KEY`, `KIS_APP_SECRET`, `KIS_ACCOUNT_NO` (`12345678-01`) | 한국투자증권 (시세 포함). `KIS_HTS_ID` 는 읽히지만 **현재 미사용(예약)** — 이 봇이 쓰는 API 에는 필요 없음 |
 | `ALPACA_API_KEY`, `ALPACA_SECRET_KEY` (별칭 `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`) | Alpaca (시세 포함) |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `SLACK_WEBHOOK_URL`, `DISCORD_WEBHOOK_URL` | 알림 |
+
+- `.env` 탐색 순서: **현재 디렉터리(상위로 올라가며) → 설정 파일 디렉터리 → 그 상위** (`tradingbot init --dir DIR` 레이아웃).
+  처음 찾은 파일 하나만 읽고, 이미 export 된 환경변수가 우선합니다. `validate-config` 의 "환경변수 파일" 행에서 어떤 파일을
+  읽었는지 확인할 수 있습니다 (값은 출력하지 않습니다).
+- `tradingbot init` 은 `.env` 를 소유자만 읽을 수 있게(권한 600) 만듭니다. 직접 `cp .env.example .env` 했다면 `chmod 600 .env` 를 권장합니다.
 
 ## 전략
 
@@ -334,6 +341,10 @@ KIS/Alpaca 는 시세에도 키가 필요하므로 키가 없으면 `--source yf
 **Q. 실거래가 시작되지 않아요.**
 설정의 `mode: live` 와 `run --live` 플래그가 **둘 다** 있어야 합니다. `broker.name` 이 `paper` 면 안 되고, 해당 브로커의 키가
 `.env` 에 있어야 합니다. `validate-config` 로 먼저 확인하세요.
+
+**Q. `.env` 에 키를 넣었는데 "환경변수 ... 가 비어 있습니다" 경고가 납니다.**
+CLI 는 현재 디렉터리(상위 포함) → 설정 파일 디렉터리 → 그 상위 순서로 `.env` 를 찾습니다. `validate-config` 출력의 "환경변수 파일"
+행에서 어떤 파일을 읽었는지(또는 못 찾았는지) 확인하세요. 변수 이름 오타와 값 앞뒤 공백도 확인하세요.
 
 **Q. `sandbox: true` 가 무슨 뜻인가요?**
 KIS 는 모의투자 서버, Alpaca 는 paper-api, ccxt 는 테스트넷에 접속합니다. Upbit 는 모의 서버가 없어 무시됩니다.

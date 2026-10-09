@@ -5,7 +5,12 @@
 - 베이스 URL: 모의투자 ``https://paper-api.alpaca.markets``, 실거래 ``https://api.alpaca.markets``,
   시세 ``https://data.alpaca.markets`` (docs/authentication, docs/paper-trading).
 - 인증 헤더: ``APCA-API-KEY-ID`` / ``APCA-API-SECRET-KEY`` (docs/authentication). 시세 API 도 같은 키가 필요하다.
-- ``GET /v2/account`` → ``{cash, equity, buying_power, currency: "USD", status, trading_blocked, ...}`` (숫자는 문자열).
+- ``GET /v2/account`` → ``{cash, equity, buying_power, non_marginable_buying_power, currency: "USD", status,
+  trading_blocked, ...}`` (숫자는 문자열). ``cash`` 는 현금 잔고, ``equity = cash + long_market_value +
+  short_market_value``, ``non_marginable_buying_power`` 는 미체결 주문을 뺀 비마진 매수 여력 (reference/getaccount-1).
+- ``GET /v2/assets/{symbol_or_asset_id}`` → Asset ``{id, class, exchange, symbol, name, status, tradable, marginable,
+  shortable, easy_to_borrow, fractionable, ...}``. docs/fractional-trading: 소수점 주문 전에 ``fractionable: true``
+  를 확인해야 하며, 아니면 ``"requested asset is not fractionable"`` 로 거부된다 (약 2,000 종목만 소수점 가능).
 - ``GET /v2/positions`` → ``[{symbol, qty, qty_available, avg_entry_price, side: "long", market_value,
   current_price, asset_class, ...}]`` (숫자는 문자열).
 - ``POST /v2/orders`` 본문 ``{symbol, qty | notional, side, type(market|limit|stop|stop_limit|trailing_stop),
@@ -30,9 +35,10 @@
 - 오류: 401 인증 실패, 403 권한/매수여력 부족, 422 입력 오류, 429 레이트리밋(``X-RateLimit-*`` 헤더, 200회/분).
 
 수량 정책 (round_quantity)
-- 정규장(``is_market_open``)에는 시장가 소수점 주식(소수 9자리 내림)을 쓴다.
-- 그 외(장외, 지정가)는 정수 주로 내림한다. 지정가는 항상 정수 주 (보수적 정책: 소수 지정가는 거래소가
-  day 주문으로만 허용하고 종목별 fractionable 여부가 달라 거부될 수 있음).
+- 정규장(``is_market_open``) 이고 종목이 ``fractionable`` 이면 시장가 소수점 주식(소수 9자리 내림)을 쓴다.
+  종목 정보는 ``GET /v2/assets/{symbol}`` 로 심볼당 한 번 조회해 캐시한다 (조회 실패 시 소수점 가능으로 간주하고 경고).
+- 그 외(장외, 지정가, 비(非)fractionable 종목)는 정수 주로 내림한다. 지정가는 항상 정수 주 (보수적 정책: 소수
+  지정가는 거래소가 day 주문으로만 허용함).
 """
 
 from __future__ import annotations
@@ -214,6 +220,8 @@ class AlpacaBroker(BaseBroker):
         )
         self._clock: dict[str, Any] | None = None
         self._clock_fetched_at: float | None = None
+        #: 심볼 → Asset (``GET /v2/assets/{symbol}``). fractionable 여부는 거의 바뀌지 않으므로 프로세스 수명 동안 캐시.
+        self._assets: dict[str, dict[str, Any]] = {}
 
     @classmethod
     def from_config(cls, config: AppConfig) -> AlpacaBroker:
@@ -255,14 +263,15 @@ class AlpacaBroker(BaseBroker):
         return MIN_ORDER_VALUE_USD
 
     def round_quantity(self, symbol: str, quantity: float, *, fractional: bool | None = None) -> float:
-        """정규장 중이면 소수 9자리 내림(소수점 주식), 아니면 정수 주로 내림.
+        """정규장 중이고 종목이 fractionable 이면 소수 9자리 내림(소수점 주식), 아니면 정수 주로 내림.
 
-        ``fractional`` 을 주면 장 운영 여부 조회 없이 그 정책을 강제한다.
+        ``fractional`` 을 주면 장 운영 여부/종목 정보 조회 없이 그 정책을 강제한다.
         """
         if quantity is None or quantity <= 0:
             return 0.0
-        allow_fraction = self.is_market_open() if fractional is None else fractional
-        if allow_fraction:
+        if fractional is None:
+            fractional = self.is_market_open() and self._is_fractionable(symbol)
+        if fractional:
             return float(Decimal(str(quantity)).quantize(_QTY_STEP, rounding=ROUND_DOWN))
         return float(math.floor(quantity))
 
@@ -442,14 +451,44 @@ class AlpacaBroker(BaseBroker):
         return dict(payload)
 
     def get_balances(self) -> dict[str, Balance]:
-        """``{"USD": Balance(total=equity, available=cash)}``."""
+        """``{"USD": Balance(total=cash, available=min(cash, non_marginable_buying_power))}``.
+
+        ``total`` 은 다른 어댑터와 같이 **현금 잔고**(``cash``) 다 — 포지션 평가액이 섞인 ``equity`` 는
+        ``get_equity()`` 가 준다 (total 에 equity 를 두면 ``locked`` 가 보유 주식 평가액이 되고 엔진의 fallback
+        equity 가 포지션을 이중 계산한다). ``available`` 은 미체결 주문에 묶인 금액을 뺀 비마진 매수 여력
+        (``non_marginable_buying_power``, 없으면 ``buying_power``) 과 현금 중 작은 값이라 ``locked`` 가
+        주문에 묶인 현금이 된다.
+        """
         acct = self.get_account()
         currency = str(acct.get("currency") or "USD")
-        return {
-            currency: Balance(
-                currency=currency, total=_to_float(acct.get("equity")), available=_to_float(acct.get("cash"))
-            )
-        }
+        cash = _to_float(acct.get("cash"))
+        available = cash
+        for key in ("non_marginable_buying_power", "buying_power"):
+            raw = acct.get(key)
+            if raw not in (None, ""):
+                available = min(cash, _to_float(raw))
+                break
+        return {currency: Balance(currency=currency, total=cash, available=available)}
+
+    def get_asset(self, symbol: str) -> dict[str, Any]:
+        """``GET /v2/assets/{symbol}`` (Asset 구조: tradable, fractionable, status, ...). 심볼별로 캐시한다."""
+        cached = self._assets.get(symbol)
+        if cached is not None:
+            return cached
+        payload = self._trading("GET", f"/v2/assets/{symbol}")
+        if not isinstance(payload, Mapping):
+            raise BrokerError(f"Alpaca asset 응답 형식 오류: {payload!r}")
+        asset = dict(payload)
+        self._assets[symbol] = asset
+        return asset
+
+    def _is_fractionable(self, symbol: str) -> bool:
+        """종목의 ``fractionable`` 플래그. 조회 실패 시 소수점 가능으로 간주(이전 정책 유지) 하고 경고한다."""
+        try:
+            return bool(self.get_asset(symbol).get("fractionable"))
+        except BrokerError as e:
+            logger.warning("Alpaca %s 종목 정보 조회 실패, 소수점 주문 가능으로 간주합니다: %s", symbol, e)
+            return True
 
     def get_positions(self) -> dict[str, Position]:
         payload = self._trading("GET", "/v2/positions")
