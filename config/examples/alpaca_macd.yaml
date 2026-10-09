@@ -1,0 +1,92 @@
+# =============================================================================
+# 예시: Alpaca 미국주식 1시간봉 MACD
+#
+#   - MACD 선이 시그널 선을 상향 돌파하면 매수, 하향 돌파하면 매도
+#   - sandbox: true 면 Alpaca paper-api (모의 계좌) 를 사용합니다. 시세는 data.alpaca.markets (feed=iex)
+#   - 정규장 09:30~16:00 ET 에만 주문이 나갑니다. 소수점 주식 주문이 가능하므로 소액으로도 분산 가능
+#   - .env 에 ALPACA_API_KEY / ALPACA_SECRET_KEY (또는 APCA_API_KEY_ID / APCA_API_SECRET_KEY) 필요
+#   - 실행:  tradingbot run -c config/examples/alpaca_macd.yaml
+# =============================================================================
+
+# 실행 모드. paper = 실제 Alpaca 시세로 모의 체결
+mode: paper
+
+# 브로커: Alpaca
+broker:
+  name: alpaca                # Alpaca 어댑터
+  sandbox: true               # true = paper-api.alpaca.markets (모의 계좌), false = api.alpaca.markets (실계좌)
+  fill_timeout_sec: 30        # 체결 확인 대기(초)
+  extra: {}                   # 어댑터 추가 옵션 (보통 비움)
+
+# 매매 대상 (Alpaca 표기: 티커)
+symbols:
+  - AAPL
+  - MSFT
+  - SPY
+
+# 1시간봉 (Alpaca bars timeframe 1Hour)
+interval: 1h
+
+# 전략: MACD
+strategy:
+  name: macd                  # MACD 교차 전략
+  params:                     # 전략 파라미터
+    fast: 12                  # 단기 EMA 기간
+    slow: 26                  # 장기 EMA 기간
+    signal: 9                 # 시그널 EMA 기간
+
+# 리스크 관리
+risk:
+  max_position_pct: 0.25      # 종목당 총자산의 25%
+  max_positions: 3            # 동시 보유 최대 3종목
+  stop_loss_pct: 0.02         # -2% 손절
+  take_profit_pct: 0.05       # +5% 익절
+  trailing_stop_pct: 0.02     # 고점 대비 -2% 추적 손절
+  max_daily_loss_pct: 0.03    # 일일 손실 한도 -3%
+  min_order_value: 1          # Alpaca 소수점 주식 최소 주문 1 USD
+  capital_limit: null         # 총자산 기준
+
+# 모의투자 설정 (paper 모드)
+paper:
+  initial_cash: 10000         # 시작 현금 10,000 USD
+  quote_currency: USD         # 결제 통화
+  fee_pct: 0.0                # Alpaca 는 수수료 무료 (매도 시 소액 규제 수수료는 무시)
+  slippage_pct: 0.0005        # 슬리피지 0.05% 가정
+
+# 실시간 엔진
+engine:
+  poll_seconds: 30                        # 시세 확인 주기(초)
+  candle_limit: 300                       # 전략에 넘길 캔들 수 (MACD 워밍업 충분)
+  state_file: data/state_alpaca_macd.json # 상태 파일
+  close_positions_at_market_close: true   # 장 마감 전 전량 청산 (오버나이트 리스크 회피)
+  sync_positions_on_start: true           # 시작 시 계좌 포지션 동기화
+  stale_data_minutes: 90                  # 장중 1시간봉이 90분 넘게 안 바뀌면 경고
+
+# 알림 (토큰/웹훅은 .env)
+notify:
+  telegram:                   # 텔레그램 봇 알림
+    enabled: false            # 텔레그램
+  slack:                      # 슬랙 Incoming Webhook 알림
+    enabled: false            # 슬랙
+  discord:                    # 디스코드 Webhook 알림
+    enabled: false            # 디스코드
+  notify_on_signal: false     # 신호 알림 끔
+  notify_on_trade: true       # 체결 알림
+  notify_on_error: true       # 오류 알림
+  daily_summary: true         # 장 마감 후 일일 요약
+
+# 백테스트 (Alpaca bars 또는 yfinance 'AAPL' 로 내려받은 데이터 사용)
+backtest:
+  start: "2025-01-01"         # 시작일
+  end: null                   # 종료일 (null = 최신)
+  data_dir: data/candles      # 캔들 CSV 저장 위치 (data/candles/alpaca/AAPL_1h.csv)
+  initial_cash: 10000         # 시작 자금 (USD)
+  fee_pct: 0.0                # 수수료 무료
+  slippage_pct: 0.0005        # 슬리피지
+  fill_on: next_open          # 다음 캔들 시가 체결
+  report_dir: reports         # 리포트 저장 위치
+
+# 로깅
+logging:
+  level: INFO                 # 로그 레벨
+  file: logs/alpaca_macd.log  # 로그 파일

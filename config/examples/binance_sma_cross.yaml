@@ -1,0 +1,91 @@
+# =============================================================================
+# 예시: Binance(ccxt) 1시간봉 SMA 골든/데드크로스
+#
+#   - 단기 SMA 가 장기 SMA 를 상향 돌파(골든크로스)하면 매수, 하향 돌파(데드크로스)하면 매도
+#   - ccxt 어댑터를 사용하므로 exchange_id 만 바꾸면 bybit, okx, bithumb 등도 가능
+#   - 실행:  tradingbot run -c config/examples/binance_sma_cross.yaml   (모의투자)
+#   - .env 에 CCXT_API_KEY / CCXT_SECRET (또는 BINANCE_API_KEY / BINANCE_SECRET_KEY) 가 있어야 실거래·잔고 조회 가능
+#   - 공개 시세(캔들/현재가)는 키 없이 조회됩니다
+# =============================================================================
+
+# 실행 모드. paper = 실제 Binance 시세로 모의 체결
+mode: paper
+
+# 브로커: Binance (ccxt)
+broker:
+  name: binance               # binance 는 ccxt 어댑터의 별칭 (exchange_id 자동 설정)
+  exchange_id: binance        # ccxt 거래소 id. 다른 거래소: bybit, okx, bithumb ...
+  sandbox: true               # ccxt set_sandbox_mode(True) → Binance 테스트넷 사용 (실거래 전 검증)
+  fill_timeout_sec: 30        # 체결 확인 대기(초)
+  extra: {}                   # ccxt 생성자 추가 옵션 (예: {"options": {"defaultType": "spot"}})
+
+# 매매 대상 (ccxt 통일 표기: {기초자산}/{결제통화})
+symbols:
+  - BTC/USDT
+  - ETH/USDT
+
+# 1시간봉
+interval: 1h
+
+# 전략: SMA 교차
+strategy:
+  name: sma_cross             # 단순이동평균 교차 (ema_cross 로 바꾸면 EMA 버전)
+  params:                     # 전략 파라미터
+    fast: 10                  # 단기 SMA 기간 (10시간)
+    slow: 30                  # 장기 SMA 기간 (30시간)
+
+# 리스크 관리
+risk:
+  max_position_pct: 0.3       # 종목당 총자산의 30% 까지
+  max_positions: 2            # 동시 보유 최대 2종목
+  stop_loss_pct: 0.02         # -2% 손절
+  take_profit_pct: 0.06       # +6% 익절
+  trailing_stop_pct: 0.03     # 고점 대비 -3% 추적 손절
+  max_daily_loss_pct: 0.05    # 일일 손실 한도 -5%
+  min_order_value: 10         # Binance 현물 최소 주문 금액(USDT) 이상으로 여유 있게
+  capital_limit: null         # 총자산 기준
+
+# 모의투자 설정
+paper:
+  initial_cash: 10000         # 시작 현금 10,000 USDT
+  quote_currency: USDT        # 결제 통화
+  fee_pct: 0.001              # Binance 현물 기본 수수료 0.1%
+  slippage_pct: 0.0005        # 슬리피지 0.05% 가정
+
+# 실시간 엔진
+engine:
+  poll_seconds: 30                        # 시세 확인 주기(초)
+  candle_limit: 300                       # 전략에 넘길 캔들 수 (slow=30 보다 충분히 큼)
+  state_file: data/state_binance_sma.json # 상태 파일
+  close_positions_at_market_close: false  # 암호화폐는 24시간 거래
+  sync_positions_on_start: true           # 시작 시 보유 코인 동기화
+  stale_data_minutes: 90                  # 1시간봉이 90분 넘게 안 바뀌면 경고
+
+# 알림 (토큰/웹훅은 .env)
+notify:
+  telegram:                   # 텔레그램 봇 알림
+    enabled: false            # 텔레그램
+  slack:                      # 슬랙 Incoming Webhook 알림
+    enabled: false            # 슬랙
+  discord:                    # 디스코드 Webhook 알림
+    enabled: false            # 디스코드
+  notify_on_signal: false     # 신호마다 알림은 끔
+  notify_on_trade: true       # 체결 알림
+  notify_on_error: true       # 오류 알림
+  daily_summary: true         # 일일 요약
+
+# 백테스트
+backtest:
+  start: "2025-01-01"         # 시작일
+  end: null                   # 종료일 (null = 최신)
+  data_dir: data/candles      # 캔들 CSV 저장 위치 (data/candles/binance/BTC_USDT_1h.csv)
+  initial_cash: 10000         # 시작 자금 (USDT)
+  fee_pct: 0.001              # 수수료 0.1%
+  slippage_pct: 0.0005        # 슬리피지
+  fill_on: next_open          # 다음 캔들 시가 체결
+  report_dir: reports         # 리포트 저장 위치
+
+# 로깅
+logging:
+  level: INFO                 # 로그 레벨
+  file: logs/binance_sma.log  # 로그 파일

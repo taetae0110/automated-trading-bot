@@ -250,4 +250,6 @@ def interval_to_seconds(interval: str) -> int:
     try:
         return INTERVAL_SECONDS[interval]
     except KeyError as e:
-        raise ValueError(f"지원하지 않는 캔들 간격: {interval!r} (가능: {', '.join(INTERVAL_SECONDS)})") from e
+        raise ValueError(
+            f"지원하지 않는 캔들 간격: {interval!r} (가능: {', '.join(INTERVAL_SECONDS)})"
+        ) from e

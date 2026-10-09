@@ -1,0 +1,99 @@
+# =============================================================================
+# tradingbot 기본 설정 예시 (config/config.example.yaml)
+#
+#   복사해서 사용:  cp config/config.example.yaml config/config.yaml
+#   검증:          tradingbot validate-config -c config/config.yaml
+#
+# - API 키/시크릿은 이 파일에 적지 않습니다. 반드시 .env (.env.example 참고) 에만 둡니다.
+# - 비율 값은 모두 0~1 사이 소수입니다 (0.02 = 2%).
+# - 시세/백테스트 데이터는 항상 실제 거래소에서 내려받습니다. 샘플 데이터는 없습니다.
+# - 전략별 예시는 config/examples/ 를 참고하세요.
+# =============================================================================
+
+# 실행 모드: backtest | paper | live
+#   paper : 실제 시세로 모의 체결 (PaperBroker). 실제 주문은 나가지 않습니다. (기본값, 권장)
+#   live  : 실거래. broker.name 이 paper 면 안 되며 `tradingbot run --live` 로만 시작됩니다.
+mode: paper
+
+# ----------------------------------------------------------------------------- 브로커
+# 시세 조회와 (live 모드에서) 주문을 담당할 거래소/증권사
+broker:
+  name: upbit                 # 브로커 이름: paper | upbit | binance | ccxt | kis | alpaca
+  exchange_id: null           # ccxt 전용 거래소 id (binance, bybit, okx, bithumb ...). name=binance 면 자동 설정
+  sandbox: true               # KIS 모의투자 / Alpaca paper 서버 / ccxt sandbox 사용. 실거래 전 반드시 true 로 검증
+  fill_timeout_sec: 30        # 주문 후 체결 확인을 기다리는 최대 시간(초)
+  extra: {}                   # 어댑터별 추가 옵션 (보통 비워 둠)
+
+# 매매 대상 심볼. 브로커 네이티브 표기를 사용합니다.
+#   표기 예: Upbit KRW-BTC | ccxt/Binance BTC/USDT | KIS 005930 | Alpaca AAPL
+symbols:
+  - KRW-BTC
+  - KRW-ETH
+
+# 캔들 간격: 1m 3m 5m 10m 15m 30m 1h 4h 1d 1w (브로커가 지원하는 값만 사용)
+interval: 1h
+
+# ----------------------------------------------------------------------------- 전략
+# `tradingbot strategies` 로 전략 목록과 파라미터를 확인할 수 있습니다.
+strategy:
+  name: sma_cross             # 전략 이름: sma_cross | ema_cross | rsi | bollinger | macd | volatility_breakout
+  params:                     # 전략별 파라미터 (생략하면 기본값)
+    fast: 10                  # 단기 이동평균 기간
+    slow: 30                  # 장기 이동평균 기간
+
+# ----------------------------------------------------------------------------- 리스크 관리
+risk:
+  max_position_pct: 0.2       # 종목당 최대 투자 비중 (총자산 대비)
+  max_positions: 2            # 동시에 보유할 수 있는 최대 종목 수
+  stop_loss_pct: 0.03         # 손절 비율 (평균단가 대비 -3%). null 이면 사용 안 함
+  take_profit_pct: 0.08       # 익절 비율 (+8%). null 이면 사용 안 함
+  trailing_stop_pct: null     # 고점 대비 추적 손절 비율. null 이면 사용 안 함
+  max_daily_loss_pct: 0.05    # 일일 누적 손실 한도. 초과 시 당일 신규 진입 중단
+  min_order_value: 5000       # 최소 주문 금액 (quote 통화). Upbit KRW 마켓은 5,000원. 0 이면 브로커 기본값
+  capital_limit: null         # 총자산 대신 이 금액만 운용 기준으로 삼을 때 (예: 1000000). null 이면 총자산
+
+# ----------------------------------------------------------------------------- 모의투자 (PaperBroker)
+paper:
+  initial_cash: 10000000      # 시작 현금 (quote 통화 기준, 1,000만원)
+  quote_currency: KRW         # 결제 통화. Upbit/KIS KRW, Binance USDT, Alpaca USD
+  fee_pct: 0.0005             # 매수/매도 각각 적용되는 수수료율 (Upbit KRW 마켓 0.05%)
+  slippage_pct: 0.0005        # 시장가 체결 슬리피지 가정
+
+# ----------------------------------------------------------------------------- 실시간 엔진
+engine:
+  poll_seconds: 30                        # 시세/캔들 확인 주기(초)
+  candle_limit: 300                       # 전략에 넘길 최근 캔들 개수 (전략 warmup 보다 충분히 크게)
+  state_file: data/state.json             # 포지션/대기 주문 등 상태 저장 파일
+  close_positions_at_market_close: false  # 장 마감 시 전량 청산 (주식 데이트레이딩용)
+  sync_positions_on_start: true           # 시작 시 거래소 보유 포지션을 상태 파일과 동기화
+  stale_data_minutes: 30                  # 이 시간 동안 캔들이 갱신되지 않으면 경고
+
+# ----------------------------------------------------------------------------- 알림
+# 토큰/웹훅 URL 은 .env 에 둡니다 (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SLACK_WEBHOOK_URL, DISCORD_WEBHOOK_URL)
+notify:
+  telegram:                   # 텔레그램 봇 알림
+    enabled: false            # 텔레그램 알림 사용 여부
+  slack:                      # 슬랙 Incoming Webhook 알림
+    enabled: false            # 슬랙 웹훅 알림 사용 여부
+  discord:                    # 디스코드 Webhook 알림
+    enabled: false            # 디스코드 웹훅 알림 사용 여부
+  notify_on_signal: false     # 매매 신호가 날 때마다 알림 (잦을 수 있음)
+  notify_on_trade: true       # 체결 시 알림
+  notify_on_error: true       # 오류 발생 시 알림
+  daily_summary: true         # 일일 요약 알림
+
+# ----------------------------------------------------------------------------- 백테스트
+backtest:
+  start: "2025-01-01"         # 백테스트 시작일 (YYYY-MM-DD). null 이면 저장된 데이터 처음부터
+  end: null                   # 종료일. null 이면 가장 최근까지
+  data_dir: data/candles      # 내려받은 캔들 CSV 저장 위치 ({data_dir}/{broker}/{symbol}_{interval}.csv)
+  initial_cash: 10000000      # 백테스트 시작 자금
+  fee_pct: 0.0005             # 수수료율 (매수/매도 각각)
+  slippage_pct: 0.0005        # 슬리피지
+  fill_on: next_open          # 시장가 체결 시점: next_open(다음 캔들 시가, 현실적) | close(신호 캔들 종가)
+  report_dir: reports         # 결과 리포트 저장 디렉터리
+
+# ----------------------------------------------------------------------------- 로깅
+logging:
+  level: INFO                 # 로그 레벨: DEBUG | INFO | WARNING | ERROR
+  file: logs/tradingbot.log   # 로그 파일 경로 (회전 저장). null 이면 콘솔만

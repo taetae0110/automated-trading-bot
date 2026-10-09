@@ -78,7 +78,9 @@ class HttpClient:
                 raise BrokerError(f"{method} {url} 네트워크 오류: {e}") from e
 
             if resp.status_code in RETRY_STATUS and attempt < attempts - 1:
-                logger.warning("%s %s -> %s, 재시도 %d/%d", method, url, resp.status_code, attempt + 1, attempts - 1)
+                logger.warning(
+                    "%s %s -> %s, 재시도 %d/%d", method, url, resp.status_code, attempt + 1, attempts - 1
+                )
                 self._sleep(attempt, retry_after=resp.headers.get("Retry-After"))
                 continue
             return self._handle(resp, method, url)

@@ -14,7 +14,7 @@ htmlcov/
 # 비밀/로컬 데이터
 .env
 *.env.local
-data/
+/data/
 logs/
 reports/
 *.token

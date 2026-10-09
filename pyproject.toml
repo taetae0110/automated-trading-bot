@@ -48,6 +48,14 @@ filterwarnings = ["ignore::DeprecationWarning"]
 line-length = 110
 target-version = "py310"
 
+[tool.ruff.format]
+# 문서의 코드 블록(README/docs *.md)은 포맷 검사 대상에서 제외한다
+exclude = ["*.md"]
+
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
 ignore = ["E501", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# BaseBroker.close() 는 의도적으로 비어 있는 non-abstract 훅 메서드 (어댑터가 필요 시 재정의)
+"tradingbot/brokers/base.py" = ["B027"]

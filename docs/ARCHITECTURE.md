@@ -245,3 +245,79 @@ tradingbot optimize ...  (선택: 파라미터 그리드 탐색)
 | alpaca | stock(US) | APCA 헤더 | data.alpaca.markets /v2/stocks/bars (feed=iex) | paper-api vs api 베이스, 소수점 주식 가능(시장가, tif=day), /v2/clock |
 
 각 어댑터의 공개 메서드 동작은 `BaseBroker` docstring 을 따른다. `get_candles` 는 **오래된→최신**, 미완성 캔들 제외(include_partial=False).
+
+## 11. 통합 시 확정된 보충 사항 (구현 보고서의 계약 변경 요청 반영)
+
+아래는 병렬 구현 후 통합 과정에서 **확정**한 세부 규약이다. 위 본문과 충돌하면 이 절이 우선한다.
+
+### 고정 파일 변경 이력
+- 4개 고정 파일(`brokers/base.py`, `config.py`, `models.py`, `utils/http.py`)은 `ruff format` 결과(공백/줄바꿈)만 반영.
+- `BaseBroker.round_quantity` 기본 구현을 Decimal(ROUND_FLOOR, 소수 8자리) 로 교체 — `math.floor(q*1e8)/1e8` 은
+  0.29 → 0.28999999 같은 오차를 냈다. 시그니처/의미(내림) 는 동일.
+- `BaseBroker.get_candles` docstring 에 `end` 가 **배타적**(`candle.timestamp < end`) 임을 명시. 모든 어댑터가 이 의미를 따른다.
+- `ruff` B027(`BaseBroker.close` 빈 훅) 은 `pyproject.toml` 의 per-file-ignore 로 처리. `.gitignore` 의 `data/` 는 `/data/`
+  (루트만) 로 바꿔 패키지 `tradingbot/data/` 가 무시되지 않게 했다.
+
+### 시세/데이터
+- `UpbitBroker.get_candles` 는 limit > 200 이면 `to`(배타적) 를 가장 오래된 캔들 시각으로 옮기며 과거 방향으로 페이지네이션한다
+  (엔진 기본 `candle_limit: 300` 이 그대로 동작). `include_partial=False` 일 때는 완성 캔들 limit 개를 맞추기 위해 한 개를 더 요청.
+- `CandleStore.download(start, end)` 의 start/end 는 **포함**(inclusive) 이다 — 내부적으로 `broker.get_candles(end=end+interval)` 로
+  요청한다. `list_available()` 은 `symbol_safe`('/'→'_') 형태로 돌려준다.
+- `indicators.crossover/crossunder` 는 `b` 에 스칼라(예: RSI 30 선) 도 받는다.
+
+### PaperBroker 확장 (백테스터/엔진이 의존)
+- `mark_price(symbol, price, timestamp=None)`: timestamp 를 주면 모의 시계가 되어 Order/Position/Trade 시각이 bar 시각이 된다.
+  `process_candle` 도 모의 시계를 `candle.timestamp` 로 옮긴다. 시계를 주지 않으면 `clock`(기본 utcnow) 사용.
+- `place_order(..., *, stop_offset=None, reason="")`: `reason` 은 매도 체결 시 `Trade.reason` 에 기록된다.
+- `orders` 프로퍼티(전체 주문 스냅샷, 생성 순). STOP 주문의 `raw["trigger"]`/`raw["stop_offset"]` 에 트리거/오프셋 기록.
+- `check_pending(symbol, price)` 는 `stop_offset` 전용(price=None) STOP 을 건너뛴다 (트리거가 "다음 캔들 시가 + offset" 이라
+  단일 가격으로 판정 불가; `process_candle` 에서만 체결). 트리거 시점에 현금이 모자라면 주문은 REJECTED(`raw["reject_reason"]`).
+- `get_positions()` 는 살아있는 Position 객체를 돌려준다 (RiskManager 가 stop_loss/highest_price/meta 를 그 자리에서 갱신).
+- `from_dict` 는 **새 인스턴스**를 만든다. 따라서 `Trader.start()` 는 저장된 모의계좌가 있으면 `self.broker` 를 교체하며,
+  CLI 는 `start()`/`run_once()` 이후 반드시 `trader.broker` 를 사용한다.
+
+### RiskManager
+- `from_dict(d)` 는 인스턴스 메서드(in-place 복원, `self` 반환): `risk.from_dict(state.get("risk"))`.
+- `apply_entry` 는 `signal.meta` 의 `entry_bar_ts` > `bar_ts` > `timestamp` > `candle_ts` 순으로 진입 bar 시각을 읽어
+  `position.meta["entry_bar_ts"]` 에 기록한다. 엔진/백테스터는 호출 전에 `signal.meta["entry_bar_ts"]` 를 설정한다.
+- 당일 `start_day` 가 호출되지 않았으면 일일 손실 한도는 적용하지 않고 하루 한 번 경고한다.
+
+### 백테스터
+- bar 시작 처리 순서: **max_holding 만료 청산 → 이전 bar 의 대기 주문 → 리스크 청산**. 만료 청산이 먼저이므로 같은 bar 에
+  대기 매수로 재진입할 수 있다 (변동성 돌파가 매일 거래 가능; 엔진 §6 a→b→d 와 동일).
+- 다음 bar 시가에 만료될 포지션을 보유 중일 때 나온 BUY 신호는 **수락**되어 대기 주문이 된다.
+- STOP/LIMIT 매수 대기 주문은 다음 bar **시작 시점**(mark_price(open) 직후) 에 정확한 트리거/지정가 기준으로 수량을 정해
+  등록하고, 그 bar 에서 체결되지 않으면 취소한다 (1-bar 유효). 따라서 `Order.created_at` 은 체결 bar 시각이다.
+- 같은 bar 에서 트리거로 체결된 포지션은 low/high 순서를 알 수 없으므로 bar 내 손절/익절 판정을 건너뛰고 종가에서만 판정한다.
+- `Backtester(..., asset_class=CRYPTO, min_order_value=0.0, round_quantity=None)` 추가 키워드,
+  `compute_metrics(..., exposure=None)`, `periods_per_year` 는 AssetClass 또는 "crypto"/"stock" 문자열.
+  `BacktestResult` 는 계약 필드 뒤에 fill_on/fee_pct/slippage_pct/quote_currency/asset_class/final_cash/open_positions/bars/
+  skipped_signals/skip_reasons/ignored_signals/rejected_orders 와 `total_return` 프로퍼티를 더 가진다.
+  `profit_factor` 는 손실 거래가 없으면 +inf (to_dict 에서는 None).
+
+### 엔진
+- `Trader(..., clock=utcnow, *, sleep=time.sleep)`: 체결 대기 폴링과 run_forever 대기를 주입 가능.
+- LIMIT 신호는 LIMIT 주문으로 보내고 `fill_timeout_sec` 안에 체결되지 않으면 취소. STOP 은 어떤 브로커에도 보내지 않는다
+  (돌파 대기 → 시장가). 비-Paper 브로커의 포지션 사이징 수수료율은 `config.paper.fee_pct` 를 가정한다.
+- 상태 파일(version 1): updated_at, started_at, mode, broker, data_source, strategy, strategy_params, interval, symbols, day,
+  cycles, positions, pending_breakouts, last_candle_ts, trades(최근 1000), risk, paper_broker. interval/전략이 바뀌면
+  last_candle_ts/대기 주문은 리셋, 모의계좌는 quote 통화가 같을 때만 복원.
+
+### CLI
+- `run`: `--live` 와 `mode: live` 가 **둘 다** 있어야 실거래. 한쪽만 있으면 거부(조용히 paper 로 내려가지 않음).
+- `broker.name: paper` 는 run/backtest/download/balance 에서 거부 (시세 출처가 없다).
+- binance/ccxt 를 **시세 전용**으로 쓰는 경로(paper 의 data_source, download, backtest, paper balance) 에서는 `sandbox=False`
+  로 생성한다 (테스트넷 OHLCV 가 비현실적). `--live`/`balance --live` 만 설정값을 따른다. KIS/Alpaca 는 설정 그대로.
+- 백테스트 중 `tradingbot.risk.manager`/`tradingbot.brokers.paper` 로거는 WARNING 으로 올린다 (bar 마다 INFO 방지; `--debug` 면 유지).
+- CSV 백테스트는 네트워크 어댑터를 만들지 않는다: 주식 브로커는 정수 주수 내림, 코인은 기본 1e-8 내림을 쓴다.
+- `optimize` 는 구현하지 않았다. `backtest --report-dir/--trades/--fill-on/--cash/--interval`, `download --interval/--batch/--sleep`,
+  `balance --live`, `init --dir`, `--version` 은 계약의 상위 집합.
+
+### 브로커 세부
+- Upbit: JWT 기본 HS512(`extra.jwt_algorithm: HS256` 선택), query_hash 는 URL 디코딩된 쿼리 문자열의 SHA512 (공식 문서).
+  공개 그룹 10회/초, 주문 8회/초. wait/watch 중 일부 체결은 PARTIALLY_FILLED. 시장가 매수 금액 = floor(qty × 현재가 / (1+bid_fee)).
+- ccxt: `get_positions` 의 average_price 는 0.0 (거래소가 주지 않음) — 엔진이 상태 파일의 평균단가를 유지한다. 시장가 매수는
+  기본적으로 base 수량으로 보낸다.
+- KIS: 분봉은 1분봉을 KST 경계로 집계; 연속조회(`tr_cont` 헤더) 때문에 `HttpClient.session` 을 직접 사용(재시도 규칙은 동일).
+  토큰은 `~/.tradingbot/kis_token_<paper|real>.json`(0600). 모의서버의 과거 분봉(FHKST03010230) 지원은 미검증.
+- Alpaca: 시세 포함 모든 엔드포인트에 키 필요. 장중 소수점 주식, 장외 정수 주수. `next_market_close` 프로퍼티 제공.

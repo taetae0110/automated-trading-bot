@@ -17,6 +17,7 @@ import logging
 import math
 from abc import ABC, abstractmethod
 from datetime import datetime
+from decimal import ROUND_FLOOR, Decimal, localcontext
 
 from tradingbot.models import (
     AssetClass,
@@ -48,7 +49,11 @@ class BaseBroker(ABC):
         end: datetime | None = None,
         include_partial: bool = False,
     ) -> list[Candle]:
-        """과거 캔들 조회. end(UTC) 이전의 캔들 limit 개를 오래된→최신 순으로 반환."""
+        """과거 캔들 조회. end(UTC) 이전의 캔들 limit 개를 오래된→최신 순으로 반환.
+
+        end 는 **배타적**이다: 반환되는 캔들은 모두 `candle.timestamp < end` 를 만족한다
+        (Upbit `to` 와 동일). 따라서 `end=candles[0].timestamp` 로 호출하면 겹침 없이 더 과거 페이지를 받는다.
+        """
 
     @abstractmethod
     def get_ticker(self, symbol: str) -> float:
@@ -80,16 +85,13 @@ class BaseBroker(ABC):
         """
 
     @abstractmethod
-    def cancel_order(self, order_id: str, symbol: str | None = None) -> bool:
-        ...
+    def cancel_order(self, order_id: str, symbol: str | None = None) -> bool: ...
 
     @abstractmethod
-    def get_order(self, order_id: str, symbol: str | None = None) -> Order:
-        ...
+    def get_order(self, order_id: str, symbol: str | None = None) -> Order: ...
 
     @abstractmethod
-    def get_open_orders(self, symbol: str | None = None) -> list[Order]:
-        ...
+    def get_open_orders(self, symbol: str | None = None) -> list[Order]: ...
 
     # ------------------------------------------------------------------ 메타
     @abstractmethod
@@ -105,8 +107,16 @@ class BaseBroker(ABC):
         return 0.0
 
     def round_quantity(self, symbol: str, quantity: float) -> float:
-        """거래소 수량 정밀도로 내림. 기본은 소수 8자리 내림."""
-        return math.floor(quantity * 1e8) / 1e8
+        """거래소 수량 정밀도로 내림. 기본은 소수 8자리 내림.
+
+        `math.floor(q * 1e8) / 1e8` 은 0.29 → 0.28999999 같은 부동소수 오차를 내므로 Decimal 로 계산한다.
+        NaN/inf 는 그대로 돌려준다 (검증은 호출자 몫).
+        """
+        if not math.isfinite(quantity):
+            return quantity
+        with localcontext() as ctx:
+            ctx.prec = 60
+            return float(Decimal(str(quantity)).quantize(Decimal("1e-8"), rounding=ROUND_FLOOR))
 
     def round_price(self, symbol: str, price: float) -> float:
         """거래소 호가 단위로 반올림. 기본은 그대로."""

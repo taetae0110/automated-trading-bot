@@ -50,7 +50,9 @@ class RiskConfig(BaseModel):
     stop_loss_pct: float | None = Field(0.03, ge=0, description="손절 비율. None 이면 사용 안 함")
     take_profit_pct: float | None = Field(None, ge=0, description="익절 비율. None 이면 사용 안 함")
     trailing_stop_pct: float | None = Field(None, ge=0, description="고점 대비 추적 손절 비율")
-    max_daily_loss_pct: float | None = Field(0.05, ge=0, description="일일 누적 손실 한도. 초과 시 당일 신규 진입 중단")
+    max_daily_loss_pct: float | None = Field(
+        0.05, ge=0, description="일일 누적 손실 한도. 초과 시 당일 신규 진입 중단"
+    )
     min_order_value: float = Field(0.0, ge=0, description="최소 주문 금액(quote). 0 이면 브로커 기본값")
     # 총자산 대신 고정 금액을 기준으로 포지션 크기를 정할 때 (예: 100만원만 운용)
     capital_limit: float | None = Field(None, gt=0)
@@ -226,7 +228,9 @@ class Credentials(BaseModel):
             raise ConfigError(f"환경변수가 필요합니다: {env_names} (.env 파일 또는 export 로 설정)")
 
 
-def load_config(path: str | os.PathLike[str] | None = None, overrides: dict[str, Any] | None = None) -> AppConfig:
+def load_config(
+    path: str | os.PathLike[str] | None = None, overrides: dict[str, Any] | None = None
+) -> AppConfig:
     """YAML 설정을 읽어 AppConfig 를 만든다. path 가 None 이면 기본값."""
     data: dict[str, Any] = {}
     if path is not None:

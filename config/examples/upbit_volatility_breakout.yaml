@@ -1,0 +1,91 @@
+# =============================================================================
+# 예시: Upbit(업비트) 일봉 변동성 돌파 (래리 윌리엄스)
+#
+#   - 전날 변동폭(고가-저가) * k 를 오늘 시가에 더한 가격을 돌파하면 매수, 다음날 시가에 매도
+#   - 암호화폐는 24시간 거래되므로 Upbit 일봉은 UTC 00:00(한국 09:00) 기준으로 바뀝니다
+#   - 돌파 감시를 위해 poll_seconds 를 짧게 잡습니다
+#
+#   실행:  tradingbot run -c config/examples/upbit_volatility_breakout.yaml        (모의투자)
+#   백테스트:  tradingbot download -c ... --start 2024-01-01 && tradingbot backtest -c ...
+#   .env 에 UPBIT_ACCESS_KEY / UPBIT_SECRET_KEY 가 있어야 실거래(live)·잔고 조회가 가능합니다
+# =============================================================================
+
+# 실행 모드. paper = 실제 Upbit 시세로 모의 체결 (실제 주문 없음)
+mode: paper
+
+# 브로커: Upbit (KRW 마켓). 공개 시세는 키 없이도 조회됩니다
+broker:
+  name: upbit                 # 업비트 어댑터
+  sandbox: true               # Upbit 은 모의 서버가 없지만 다른 브로커와 통일을 위해 true 유지
+  fill_timeout_sec: 30        # 시장가 주문 체결 확인 대기(초)
+
+# 매매 대상 (Upbit 표기: {결제통화}-{코인})
+symbols:
+  - KRW-BTC
+  - KRW-ETH
+
+# 변동성 돌파는 일봉 기준 전략
+interval: 1d
+
+# 전략: 변동성 돌파
+strategy:
+  name: volatility_breakout   # 전략 이름
+  params:                     # 전략 파라미터
+    k: 0.5                    # 돌파 계수 (0.3~0.7 권장). 클수록 진입이 보수적
+    ma_period: 5              # 종가가 이 기간 SMA 아래면 진입하지 않음 (0 이면 필터 끔)
+
+# 리스크 관리
+risk:
+  max_position_pct: 0.5       # 종목당 총자산의 50% 까지 (2종목이면 사실상 전액 운용)
+  max_positions: 2            # 동시 보유 최대 2종목
+  stop_loss_pct: 0.03         # 진입가 대비 -3% 손절
+  take_profit_pct: null       # 익절은 쓰지 않음 (다음날 시가 매도가 청산 규칙)
+  trailing_stop_pct: null     # 추적 손절 사용 안 함
+  max_daily_loss_pct: 0.05    # 하루 -5% 손실이면 당일 신규 진입 중단
+  min_order_value: 5000       # Upbit KRW 마켓 최소 주문 금액 5,000원
+  capital_limit: null         # 총자산 전체를 기준으로 포지션 크기 산정
+
+# 모의투자 설정
+paper:
+  initial_cash: 10000000      # 시작 현금 1,000만원
+  quote_currency: KRW         # 결제 통화
+  fee_pct: 0.0005             # Upbit KRW 마켓 수수료 0.05%
+  slippage_pct: 0.0005        # 시장가 슬리피지 0.05% 가정
+
+# 실시간 엔진
+engine:
+  poll_seconds: 10                        # 돌파 가격 감시 주기(초). 돌파 전략은 짧게
+  candle_limit: 100                       # 일봉 100개면 ma_period 워밍업에 충분
+  state_file: data/state_upbit_vb.json    # 상태 파일 (설정별로 다르게)
+  close_positions_at_market_close: false  # 암호화폐는 장 마감이 없음
+  sync_positions_on_start: true           # 시작 시 거래소 보유 코인과 상태 동기화
+  stale_data_minutes: 1500                # 일봉은 하루(1440분) 넘게 갱신이 없어야 이상 신호
+
+# 알림 (토큰은 .env)
+notify:
+  telegram:                   # 텔레그램 봇 알림
+    enabled: false            # 텔레그램 사용 시 true + .env 의 TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID
+  slack:                      # 슬랙 Incoming Webhook 알림
+    enabled: false            # 슬랙 웹훅
+  discord:                    # 디스코드 Webhook 알림
+    enabled: false            # 디스코드 웹훅
+  notify_on_signal: true      # 돌파 대기 신호도 알림
+  notify_on_trade: true       # 체결 알림
+  notify_on_error: true       # 오류 알림
+  daily_summary: true         # 일일 요약
+
+# 백테스트
+backtest:
+  start: "2024-01-01"         # 시작일
+  end: null                   # 종료일 (null = 최신)
+  data_dir: data/candles      # Upbit 에서 내려받은 캔들 CSV 저장 위치
+  initial_cash: 10000000      # 시작 자금
+  fee_pct: 0.0005             # 수수료
+  slippage_pct: 0.0005        # 슬리피지
+  fill_on: next_open          # 시장가는 다음 캔들 시가 체결 (돌파 주문은 캔들 내 돌파 시 체결)
+  report_dir: reports         # 리포트 저장 위치
+
+# 로깅
+logging:
+  level: INFO                 # 로그 레벨
+  file: logs/upbit_vb.log     # 로그 파일
