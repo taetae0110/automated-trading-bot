@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 비밀/로컬 데이터
+.env
+*.env.local
+data/
+logs/
+reports/
+*.token
+kis_token*.json
+
+# OS/IDE
+.DS_Store
+.idea/
+.vscode/
