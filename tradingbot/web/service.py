@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -180,10 +180,12 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 # ============================================================================ 로그 마스킹
 _MASK = "***"
-#: key=value / key: value 형태의 비밀값 (키 이름으로 판별)
+#: key=value / key: value 형태의 비밀값 (키 이름에 secret/token/…/key 가 들어가면 값을 가린다. UPBIT_SECRET_KEY 처럼
+#: 밑줄로 이어진 이름도 잡기 위해 \b 대신 접두/접미 단어 문자를 허용한다)
 _KV_SECRET_RE = re.compile(
-    r"(?i)\b((?:api[_-]?)?(?:secret|token|password|passwd|pwd|access[_-]?key|secret[_-]?key|app[_-]?key|"
-    r"app[_-]?secret|api[_-]?key|webhook(?:[_-]?url)?|authorization|auth)s?)(\s*[:=]\s*)(['\"]?)([^\s'\",;]{4,})"
+    r"(?i)(?<![A-Za-z0-9])([A-Za-z0-9_\-]*?(?:secret|token|password|passwd|pwd|webhook|authorization|"
+    r"(?:access|secret|app|api|private)[_-]?key|\bkey)[A-Za-z0-9_\-]*?)"
+    r"(\s*[:=]\s*)(['\"]?)(?!\*\*\*)(?!bearer\b)([^\s'\",;]{4,})"
 )
 #: Bearer 토큰
 _BEARER_RE = re.compile(r"(?i)\b(bearer\s+)([A-Za-z0-9._\-~+/=]{8,})")
@@ -194,19 +196,21 @@ _DISCORD_RE = re.compile(r"((?:discord(?:app)?\.com)/api/webhooks/)([^\s'\"]+)")
 #: JWT (header.payload.signature)
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b")
 #: 긴 토큰처럼 생긴 문자열 (32자 이상 영숫자, 문자와 숫자가 모두 있어야 함 — 긴 단어/숫자열은 제외)
-_LONG_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_\-])(?=[A-Za-z0-9_\-]*[A-Za-z])(?=[A-Za-z0-9_\-]*\d)[A-Za-z0-9_\-]{32,}")
+_LONG_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_\-])(?=[A-Za-z0-9_\-]*[A-Za-z])(?=[A-Za-z0-9_\-]*\d)[A-Za-z0-9_\-]{32,}"
+)
 
 
 def mask_log_line(line: str) -> str:
     """등록된 비밀값(``mask_secrets``) + 토큰처럼 보이는 문자열을 ``***`` 로 가린다."""
     text = mask_secrets(line)
-    text = _KV_SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{_MASK}", text)
     text = _BEARER_RE.sub(lambda m: f"{m.group(1)}{_MASK}", text)
     text = _TELEGRAM_RE.sub(lambda m: f"{m.group(1)}{_MASK}", text)
     text = _SLACK_RE.sub(lambda m: f"{m.group(1)}{_MASK}", text)
     text = _DISCORD_RE.sub(lambda m: f"{m.group(1)}{_MASK}", text)
     text = _JWT_RE.sub(_MASK, text)
     text = _LONG_TOKEN_RE.sub(_MASK, text)
+    text = _KV_SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{_MASK}", text)
     return text
 
 
@@ -393,9 +397,7 @@ class DashboardService:
         if not symbol or not _SYMBOL_RE.fullmatch(symbol):
             raise WebError(400, f"심볼 형식이 잘못되었습니다: {symbol!r}")
         if interval not in INTERVAL_SECONDS:
-            raise WebError(
-                400, f"지원하지 않는 interval {interval!r} (가능: {', '.join(INTERVAL_SECONDS)})"
-            )
+            raise WebError(400, f"지원하지 않는 interval {interval!r} (가능: {', '.join(INTERVAL_SECONDS)})")
         try:
             limit = int(limit)
         except (TypeError, ValueError) as e:
@@ -405,7 +407,8 @@ class DashboardService:
         supported = tuple(getattr(broker, "supported_intervals", ()) or ())
         if supported and interval not in supported:
             raise WebError(
-                400, f"브로커 {broker.name} 는 interval {interval!r} 를 지원하지 않습니다 (가능: {', '.join(supported)})"
+                400,
+                f"브로커 {broker.name} 는 interval {interval!r} 를 지원하지 않습니다 (가능: {', '.join(supported)})",
             )
         try:
             candles = broker.get_candles(symbol, interval, limit=limit)
@@ -431,7 +434,11 @@ class DashboardService:
     # ------------------------------------------------------------------ 상태
     def engine_alive(self) -> bool:
         with self._lock:
-            return self._trader is not None and self._engine_thread is not None and self._engine_thread.is_alive()
+            return (
+                self._trader is not None
+                and self._engine_thread is not None
+                and self._engine_thread.is_alive()
+            )
 
     def _fresh_window_sec(self) -> float:
         return max(3.0 * float(self.config.engine.poll_seconds), EXTERNAL_MIN_FRESH_SEC)
@@ -462,7 +469,7 @@ class DashboardService:
         if parsed is not None:
             return parsed
         try:
-            return datetime.fromtimestamp(self.state_store.path.stat().st_mtime, tz=ensure_utc(utcnow()).tzinfo)
+            return datetime.fromtimestamp(self.state_store.path.stat().st_mtime, tz=timezone.utc)
         except OSError:
             return None
 
@@ -678,7 +685,11 @@ class DashboardService:
         else:
             data = self._load_state()
             raw = data.get("trades") or [] if data else []
-            rows = [d for d in (self._trade_dict(t) for t in raw) if d is not None] if isinstance(raw, list) else []
+            rows = (
+                [d for d in (self._trade_dict(t) for t in raw) if d is not None]
+                if isinstance(raw, list)
+                else []
+            )
             source = "state_file" if data else "none"
         rows.reverse()
         return {"trades": rows[:limit], "total": len(rows), "source": source}
@@ -822,7 +833,11 @@ class DashboardService:
                 target=self._sample_loop, args=(trader, thread), name="tradingbot-web-equity", daemon=True
             )
             sampler.start()
-        logger.info("웹 대시보드에서 모의투자 엔진 시작 (%s, %s)", self.config.strategy.name, ", ".join(self.config.symbols))
+        logger.info(
+            "웹 대시보드에서 모의투자 엔진 시작 (%s, %s)",
+            self.config.strategy.name,
+            ", ".join(self.config.symbols),
+        )
         return self.status()
 
     def _run_engine(self, trader: Trader, data_broker: BaseBroker) -> None:
@@ -868,12 +883,10 @@ class DashboardService:
             trader.stop()
         thread.join(ENGINE_STOP_TIMEOUT_SEC)
         if thread.is_alive():
-            logger.warning("엔진 스레드가 %.0f초 안에 끝나지 않았습니다 (종료 요청은 전달됨)", ENGINE_STOP_TIMEOUT_SEC)
+            logger.warning(
+                "엔진 스레드가 %.0f초 안에 끝나지 않았습니다 (종료 요청은 전달됨)", ENGINE_STOP_TIMEOUT_SEC
+            )
             payload = self.status()
             payload["stop_pending"] = True
             return payload
         return self.status()
-
-
-def _unused(_: timedelta) -> None:  # pragma: no cover - timedelta 는 타입 힌트용 import 유지
-    return None

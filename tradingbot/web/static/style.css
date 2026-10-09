@@ -541,6 +541,13 @@ th.num,
   gap: 6px;
   font-size: 0.86rem;
   color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.card-tools select,
+.card-tools input:not([type="checkbox"]) {
+  width: auto;
+  min-width: 0;
 }
 
 .grid-2 {
@@ -623,7 +630,7 @@ th.num,
 /* ---------------------------------------------------------------- 현재가 카드 */
 .prices {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
   gap: 12px;
   margin-bottom: 16px;
 }
@@ -644,7 +651,7 @@ th.num,
 }
 
 .price-value {
-  font-size: 1.2rem;
+  font-size: 1.15rem;
   font-weight: 700;
   margin-top: 2px;
   overflow-wrap: anywhere;
@@ -745,6 +752,12 @@ tbody tr:last-child td {
 
 tbody tr:hover td {
   background: color-mix(in oklab, var(--surface-2) 60%, transparent);
+}
+
+td.cell-reason {
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 td.empty {
@@ -1079,13 +1092,23 @@ code {
 
 /* ---------------------------------------------------------------- 컨테이너 쿼리: 좁은 카드 */
 @container (width < 420px) {
-  .card-head {
-    flex-direction: column;
-    align-items: flex-start;
-  }
-
   .chart {
     height: 260px;
+  }
+
+  .card-tools {
+    width: 100%;
+  }
+}
+
+@media (width < 420px) {
+  .tabs {
+    gap: 0;
+  }
+
+  .tabs [role="tab"] {
+    padding: 10px 9px;
+    font-size: 0.92rem;
   }
 }
 
