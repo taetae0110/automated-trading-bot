@@ -722,47 +722,140 @@ class TestOpenOrders:
 
 # ============================================================================ process_candle (실제 캔들)
 class TestProcessCandle:
-    def test_limit_buy_fills_at_limit_price(self, last):
+    def test_limit_buy_fills_at_limit_price(self, daily_candles):
+        """지정가가 시가 아래·저가 이상이면 지정가에 체결된다 (슬리피지 없음, bar 중간 체결 = fill_basis 'limit')."""
+        c = next(c for c in reversed(daily_candles) if c.low < c.open)  # 실제 일봉 중 시가 아래로 내려간 bar
         b = PaperBroker(initial_cash=INITIAL_CASH, fee_pct=FEE, slippage_pct=SLIP)
-        price = (last.low + last.high) / 2  # low <= price → 체결
+        price = (c.low + c.open) / 2  # low <= price < open → 가격이 내려와 닿았을 때 지정가 체결
         qty = qty_for(b, BTC, 0.3, price)
         order = b.place_order(BTC, OrderSide.BUY, qty, OrderType.LIMIT, price=price)
-        miss = b.place_order(BTC, OrderSide.BUY, qty, OrderType.LIMIT, price=last.low * 0.5)  # 미체결
+        miss = b.place_order(BTC, OrderSide.BUY, qty, OrderType.LIMIT, price=c.low * 0.5)  # 미체결
 
-        filled = b.process_candle(BTC, last)
+        filled = b.process_candle(BTC, c)
         assert [o.id for o in filled] == [order.id]
         f = filled[0]
         assert f.status == OrderStatus.FILLED
         assert f.average_price == price  # 지정가는 슬리피지 없음
+        assert f.raw["fill_basis"] == "limit"
         assert f.filled_quantity == qty
         assert f.fee == approx(price * qty * FEE)
-        assert f.updated_at == last.timestamp
+        assert f.updated_at == c.timestamp
         assert b.get_order(miss.id).status == OrderStatus.OPEN
+        assert "fill_basis" not in b.get_order(miss.id).raw
         pos = b.get_positions()[BTC]
         assert pos.average_price == price
-        assert pos.opened_at == last.timestamp
+        assert pos.opened_at == c.timestamp
         assert b.cash == approx(INITIAL_CASH - price * qty * (1 + FEE))
         # 같은 캔들을 다시 넣어도 이미 체결된 주문은 다시 체결되지 않는다
-        assert b.process_candle(BTC, last) == []
+        assert b.process_candle(BTC, c) == []
 
-    def test_limit_sell_fills_when_high_reaches_price(self, last):
+    def test_limit_sell_fills_when_high_reaches_price(self, daily_candles):
+        """지정가가 시가 위·고가 이하면 지정가에 체결된다."""
+        c = next(c for c in reversed(daily_candles) if c.high > c.open)
         b = PaperBroker(initial_cash=INITIAL_CASH, fee_pct=FEE, slippage_pct=SLIP)
-        b.mark_price(BTC, last.open, timestamp=last.timestamp)
-        qty = qty_for(b, BTC, 0.3, last.open)
+        b.mark_price(BTC, c.open, timestamp=c.timestamp)
+        qty = qty_for(b, BTC, 0.3, c.open)
         buy = b.place_order(BTC, OrderSide.BUY, qty)
-        price = (last.low + last.high) / 2
+        price = (c.open + c.high) / 2  # open < price <= high → 지정가 체결
         broker_half = b.round_quantity(BTC, qty / 2)
         hit = b.place_order(BTC, OrderSide.SELL, broker_half, OrderType.LIMIT, price=price)
-        miss = b.place_order(BTC, OrderSide.SELL, qty - broker_half, OrderType.LIMIT, price=last.high * 2)
-        filled = b.process_candle(BTC, last)
+        miss = b.place_order(BTC, OrderSide.SELL, qty - broker_half, OrderType.LIMIT, price=c.high * 2)
+        filled = b.process_candle(BTC, c)
         assert [o.id for o in filled] == [hit.id]
         assert filled[0].average_price == price
+        assert filled[0].raw["fill_basis"] == "limit"
         assert b.get_order(miss.id).status == OrderStatus.OPEN
         t = b.trades[0]
         assert t.exit_price == price
         assert t.quantity == broker_half
         assert t.entry_price == approx(buy.average_price)
         assert t.fee == approx(buy.fee * (broker_half / qty) + price * broker_half * FEE)
+
+    def test_limit_buy_gap_through_fills_at_open_inside_bar_range(self, daily_candles):
+        """시가가 이미 지정가 아래면(갭 통과) 지정가가 아니라 시가에 체결된다 — 고가보다 높은 '체결가' 는 없다."""
+        prev_c, c = next(
+            (p, c) for p, c in zip(daily_candles, daily_candles[1:], strict=False) if c.open < p.close
+        )
+        b = PaperBroker(initial_cash=INITIAL_CASH, fee_pct=FEE, slippage_pct=SLIP)
+        b.mark_price(BTC, c.open, timestamp=c.timestamp)
+        limit = prev_c.close  # 시가보다 높은 지정가 (전봉 종가)
+        qty = qty_for(b, BTC, 0.3, limit)
+        order = b.place_order(BTC, OrderSide.BUY, qty, OrderType.LIMIT, price=limit)
+        filled = b.process_candle(BTC, c)
+        assert [o.id for o in filled] == [order.id]
+        f = filled[0]
+        assert f.price == limit  # 주문의 지정가는 그대로
+        assert f.average_price == c.open  # 체결은 시가
+        assert f.average_price < f.price
+        assert c.low <= f.average_price <= c.high
+        assert f.raw["fill_basis"] == "open"
+        assert f.fee == approx(c.open * qty * FEE)
+        assert b.get_positions()[BTC].average_price == c.open
+        # 잠근 금액(지정가 기준) 보다 적게 쓴다
+        assert b.cash == approx(INITIAL_CASH - c.open * qty * (1 + FEE))
+
+    def test_limit_sell_gap_through_fills_at_open_inside_bar_range(self, daily_candles):
+        """시가가 이미 지정가 위면(갭 통과) 시가에 체결된다 — 저가보다 낮은 '체결가' 는 없다."""
+        prev_c, c = next(
+            (p, c) for p, c in zip(daily_candles, daily_candles[1:], strict=False) if c.open > p.close
+        )
+        b = PaperBroker(initial_cash=INITIAL_CASH, fee_pct=FEE, slippage_pct=0.0)
+        b.mark_price(BTC, c.open, timestamp=c.timestamp)
+        qty = qty_for(b, BTC, 0.3, c.open)
+        b.place_order(BTC, OrderSide.BUY, qty)  # 시가 시장가 매수 (슬리피지 0)
+        limit = prev_c.close  # 시가보다 낮은 지정가
+        order = b.place_order(BTC, OrderSide.SELL, qty, OrderType.LIMIT, price=limit)
+        filled = b.process_candle(BTC, c)
+        assert [o.id for o in filled] == [order.id]
+        f = filled[0]
+        assert f.price == limit and f.average_price == c.open
+        assert c.low <= f.average_price <= c.high
+        assert f.raw["fill_basis"] == "open"
+        t = b.trades[0]
+        assert t.exit_price == c.open and t.entry_price == c.open
+        assert t.pnl == approx(-2 * c.open * qty * FEE)  # 가격 차 0, 수수료만
+
+    def test_limit_fills_never_leave_the_candle_range(self, candles):
+        """실제 1h 캔들 200개: 전봉 종가에 건 지정가의 체결가는 항상 [low, high] 안이고 min/max(지정가, 시가) 다."""
+        basis_buy: set[str] = set()
+        basis_sell: set[str] = set()
+        for prev_c, c in zip(candles, candles[1:], strict=False):
+            limit = prev_c.close
+            # 매수
+            b = PaperBroker(initial_cash=INITIAL_CASH, fee_pct=FEE, slippage_pct=SLIP)
+            b.mark_price(BTC, c.open, timestamp=c.timestamp)
+            qty = qty_for(b, BTC, 0.3, limit)
+            buy = b.place_order(BTC, OrderSide.BUY, qty, OrderType.LIMIT, price=limit)
+            filled = b.process_candle(BTC, c)
+            if c.low <= limit:
+                assert [o.id for o in filled] == [buy.id]
+                f = filled[0]
+                assert f.average_price == min(limit, c.open)
+                assert c.low <= f.average_price <= c.high
+                assert f.raw["fill_basis"] == ("open" if c.open <= limit else "limit")
+                basis_buy.add(f.raw["fill_basis"])
+            else:
+                assert filled == [] and b.get_order(buy.id).status == OrderStatus.OPEN
+            # 매도: 시가에 산 포지션을 전봉 종가 지정가로 판다
+            b2 = PaperBroker(initial_cash=INITIAL_CASH, fee_pct=FEE, slippage_pct=0.0)
+            b2.mark_price(BTC, c.open, timestamp=c.timestamp)
+            qty2 = qty_for(b2, BTC, 0.3, c.open)
+            b2.place_order(BTC, OrderSide.BUY, qty2)
+            sell = b2.place_order(BTC, OrderSide.SELL, qty2, OrderType.LIMIT, price=limit)
+            filled2 = b2.process_candle(BTC, c)
+            if c.high >= limit:
+                assert [o.id for o in filled2] == [sell.id]
+                f2 = filled2[0]
+                assert f2.average_price == max(limit, c.open)
+                assert c.low <= f2.average_price <= c.high
+                assert f2.raw["fill_basis"] == ("open" if c.open >= limit else "limit")
+                assert b2.trades[0].exit_price == f2.average_price
+                basis_sell.add(f2.raw["fill_basis"])
+            else:
+                assert filled2 == [] and b2.get_order(sell.id).status == OrderStatus.OPEN
+        # 실제 데이터에서 갭 통과(시가 체결) 와 지정가 체결이 모두 나와야 두 경로가 다 검증된 것이다
+        assert basis_buy == {"open", "limit"}
+        assert basis_sell == {"open", "limit"}
 
     def test_stop_buy_with_offset_fills_on_first_crossing_candle(self, daily_candles):
         b = PaperBroker(initial_cash=INITIAL_CASH, fee_pct=FEE, slippage_pct=SLIP)
@@ -935,18 +1028,35 @@ class TestCheckPending:
         buy = broker.place_order(BTC, OrderSide.BUY, qty, OrderType.LIMIT, price=limit_price)
         assert broker.check_pending(BTC, limit_price * 1.001) == []
         assert broker.get_ticker(BTC) == last.close  # check_pending 은 mark 하지 않는다
-        filled = broker.check_pending(BTC, limit_price * 0.999)
+        through = limit_price * 0.999
+        filled = broker.check_pending(BTC, through)
         assert [o.id for o in filled] == [buy.id]
-        assert filled[0].average_price == limit_price
+        # 현재가가 지정가를 지나쳤으면 현재가에 체결 (STOP 폴링과 같은 규칙; 지정가보다 유리한 쪽)
+        assert filled[0].average_price == through
+        assert filled[0].price == limit_price and filled[0].raw["fill_basis"] == "market"
         assert filled[0].updated_at == last.timestamp
+        assert broker.cash == approx(INITIAL_CASH - through * qty * (1 + FEE))
         sell_price = last.close * 1.02
         sell = broker.place_order(BTC, OrderSide.SELL, qty, OrderType.LIMIT, price=sell_price)
         assert broker.check_pending(BTC, sell_price * 0.999) == []
-        filled = broker.check_pending(BTC, sell_price)
+        filled = broker.check_pending(BTC, sell_price)  # 정확히 지정가 → 지정가
         assert [o.id for o in filled] == [sell.id]
         assert filled[0].average_price == sell_price
+        assert filled[0].raw["fill_basis"] == "limit"
         assert broker.trades[0].exit_price == sell_price
         assert broker.get_positions() == {}
+
+    def test_limit_sell_through_fills_at_current_price(self, broker, last):
+        qty = qty_for(broker, BTC, 0.3, last.close)
+        broker.place_order(BTC, OrderSide.BUY, qty)
+        sell_price = last.close * 1.01
+        sell = broker.place_order(BTC, OrderSide.SELL, qty, OrderType.LIMIT, price=sell_price)
+        through = sell_price * 1.004
+        filled = broker.check_pending(BTC, through)
+        assert [o.id for o in filled] == [sell.id]
+        assert filled[0].average_price == through
+        assert filled[0].raw["fill_basis"] == "market"
+        assert broker.trades[0].exit_price == through
 
     def test_stop_orders_fill_at_current_price_with_slippage(self, broker, last):
         trigger = last.close * 1.01

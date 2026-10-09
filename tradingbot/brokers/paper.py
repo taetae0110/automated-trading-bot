@@ -8,6 +8,10 @@
 - MARKET 주문은 즉시 ``현재가 * (1 ± slippage_pct)`` 로 체결하고 수수료를 현금에서 차감한다.
 - LIMIT / STOP 주문은 OPEN 상태로 보관했다가 ``process_candle()``(백테스트, 캔들 OHLC 기준) 또는
   ``check_pending()``(모의투자 폴링, 현재가 기준) 에서 체결 판정한다.
+- LIMIT 체결가는 **시장이 이미 지정가를 지나쳤으면(갭 통과) 시장 가격**, 아니면 지정가다. 캔들 경로는
+  매수 ``min(지정가, 시가)`` / 매도 ``max(지정가, 시가)`` 라 체결가가 항상 캔들 ``[low, high]`` 안에 있고,
+  폴링 경로는 현재가가 지정가를 지나쳤으면 현재가에 체결한다 (STOP 폴링 체결과 같은 규칙). 지정가에는
+  슬리피지를 더하지 않는다. 체결 근거는 ``Order.raw["fill_basis"]`` (``open``/``limit``/``trigger``/``market``).
 - 매도 체결 시 평균단가 기준으로 ``Trade`` 를 만들어 ``trades`` 에 쌓는다. Trade.fee 는
   (해당 수량에 비례 배분한 매수 수수료) + (매도 수수료).
 - 잔고 계산: 미체결 LIMIT 매수는 quote 통화를, 미체결 매도(LIMIT/STOP)는 기초자산을 잠근다(locked).
@@ -365,7 +369,8 @@ class PaperBroker(BaseBroker):
         """주문 접수.
 
         - MARKET: 즉시 ``get_ticker()*(1±slippage)`` 체결, 수수료 차감. 잔고 부족 → InsufficientFunds.
-        - LIMIT: ``price`` 필수. OPEN 으로 보관. 매수는 ``price*qty*(1+fee)`` 를 잠근다.
+        - LIMIT: ``price`` 필수. OPEN 으로 보관. 매수는 ``price*qty*(1+fee)`` 를 잠근다 (갭 통과 체결은
+          지정가보다 유리한 가격이므로 잠근 금액을 넘지 않는다).
         - STOP: ``price`` 또는 ``stop_offset`` 중 하나. ``stop_offset`` 이면 트리거는
           "다음 캔들 시가 ± offset" (process_candle 에서 결정). 현금 검사는 체결 시점에 한다.
         - ``reason`` 은 매도 체결 시 Trade.reason 으로 기록된다.
@@ -606,9 +611,19 @@ class PaperBroker(BaseBroker):
         """캔들 OHLC 로 미체결 주문의 체결가를 구한다. 체결되지 않으면 None."""
         if order.type == OrderType.LIMIT:
             assert order.price is not None
+            # 갭 통과(gap-through): 시가가 이미 지정가를 지나쳤으면 지정가가 아니라 시가에 체결된다
+            # (매수는 시가 이하, 매도는 시가 이상으로만). 따라서 체결가는 항상 [low, high] 안에 있고,
+            # 지정가에 체결됐다는 것은 bar 중간(시가 이후)에 체결됐다는 뜻이다.
             if order.side == OrderSide.BUY:
-                return order.price if candle.low <= order.price else None
-            return order.price if candle.high >= order.price else None
+                if candle.low > order.price:
+                    return None
+                base = min(order.price, candle.open)
+            else:
+                if candle.high < order.price:
+                    return None
+                base = max(order.price, candle.open)
+            order.raw["fill_basis"] = "open" if base == candle.open else "limit"
+            return base
 
         if order.type == OrderType.STOP:
             offset = float(order.raw.get("stop_offset", 0.0))
@@ -621,6 +636,7 @@ class PaperBroker(BaseBroker):
                 else:
                     return None
                 order.raw["trigger"] = trigger
+                order.raw["fill_basis"] = "open" if base == candle.open else "trigger"
                 return base * (1.0 + self._slippage_pct)
             trigger = order.price if order.price is not None else candle.open - offset
             if candle.open <= trigger:
@@ -630,6 +646,7 @@ class PaperBroker(BaseBroker):
             else:
                 return None
             order.raw["trigger"] = trigger
+            order.raw["fill_basis"] = "open" if base == candle.open else "trigger"
             return base * (1.0 - self._slippage_pct)
         return None
 
@@ -638,6 +655,12 @@ class PaperBroker(BaseBroker):
 
         체결 시각은 ``candle.timestamp`` 이며 시뮬레이션 시각도 그 값으로 옮긴다. 체결된 주문 스냅샷을
         반환한다. 자금 부족으로 체결하지 못한 주문은 REJECTED 로 바뀐다 (반환 목록에는 없음).
+
+        - LIMIT BUY : ``low <= price`` 면 ``min(price, open)`` 에 체결 (시가가 지정가 아래면 시가).
+        - LIMIT SELL: ``high >= price`` 면 ``max(price, open)`` 에 체결 (시가가 지정가 위면 시가).
+        - STOP BUY  : ``open >= trigger`` 면 시가, ``high >= trigger`` 면 트리거 (+슬리피지).
+        - STOP SELL : ``open <= trigger`` 면 시가, ``low <= trigger`` 면 트리거 (-슬리피지).
+        체결 근거는 ``raw["fill_basis"]`` 에 ``open`` / ``limit`` / ``trigger`` 로 남는다.
         """
         when = candle.timestamp
         self._sim_time = when
@@ -654,7 +677,9 @@ class PaperBroker(BaseBroker):
         """현재가 기준으로 미체결 LIMIT/STOP 주문을 체결 판정한다 (모의투자 폴링용).
 
         ``stop_offset`` 만 있는 STOP 주문은 기준 시가를 알 수 없으므로 여기서는 건너뛴다
-        (``process_candle`` 로만 체결된다).
+        (``process_candle`` 로만 체결된다). LIMIT 은 현재가가 지정가를 지나쳤으면(매수 ``price < 지정가``,
+        매도 ``price > 지정가``) 현재가에, 정확히 지정가면 지정가에 체결한다 — STOP 과 같이 "조건을 만족한
+        시점의 시장 가격" 이 체결가이며 지정가 바깥의 가격은 만들지 않는다.
         """
         if not _is_positive_finite(price):
             raise DataError(f"{symbol} 현재가가 유효하지 않습니다: {price!r}")
@@ -666,9 +691,11 @@ class PaperBroker(BaseBroker):
             if order.type == OrderType.LIMIT:
                 assert order.price is not None
                 if order.side == OrderSide.BUY and price <= order.price:
-                    fill_price = order.price
+                    fill_price = price
                 elif order.side == OrderSide.SELL and price >= order.price:
-                    fill_price = order.price
+                    fill_price = price
+                if fill_price is not None:
+                    order.raw["fill_basis"] = "limit" if fill_price == order.price else "market"
             elif order.type == OrderType.STOP:
                 if order.price is None:
                     logger.debug("[paper] %s 는 stop_offset 주문이라 check_pending 에서 건너뜁니다", order.id)
@@ -679,6 +706,7 @@ class PaperBroker(BaseBroker):
                     fill_price = price * (1.0 - self._slippage_pct)
                 if fill_price is not None:
                     order.raw["trigger"] = order.price
+                    order.raw["fill_basis"] = "market"
             if fill_price is None:
                 continue
             if self._apply_fill(order, fill_price, when):

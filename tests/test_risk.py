@@ -213,6 +213,43 @@ class TestCanOpen:
         rm.record_trade(trade2)
         assert rm.can_open(0, day2 + timedelta(hours=4))[0] is False
 
+    def test_roll_day_never_goes_backwards(
+        self, daily_candles: list[Candle], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """자정 직후 start_day 뒤에 전날 시각(거래소 시계)의 체결이 들어와도 당일 집계/시작 자산을 되감지 않는다."""
+        rm = RiskManager(RiskConfig(max_daily_loss_pct=0.05))
+        rm.start_day(EQUITY, utc(2026, 10, 9) + timedelta(seconds=1))
+        entry, exit_ = losing_pair(daily_candles)
+        qty = (0.06 * EQUITY) / (entry.close - exit_.close)  # -6% (한도 -5%)
+        t = make_trade(entry, exit_, qty)
+        t.exit_time = utc(2026, 10, 8, 23, 59) + timedelta(seconds=58)
+        with caplog.at_level(logging.WARNING, logger="tradingbot.risk.manager"):
+            rm.record_trade(t)
+        assert rm.current_day == utc(2026, 10, 9).date()
+        assert rm.day_start_equity == EQUITY and rm.daily_trades == 1
+        assert rm.daily_pnl == approx(t.pnl)
+        assert any("이전입니다" in r.getMessage() for r in caplog.records)
+        ok, why = rm.can_open(0, utc(2026, 10, 9) + timedelta(seconds=31))
+        assert ok is False and "일일 손실 한도" in why
+        assert rm.daily_pnl == approx(t.pnl) and rm.day_start_equity == EQUITY
+        # 앞으로 가는 날짜 변경은 그대로 리셋된다
+        assert rm.can_open(0, utc(2026, 10, 10)) == (True, "")
+        assert rm.daily_pnl == 0.0 and rm.day_start_equity is None
+
+    def test_record_trade_now_overrides_exit_time_for_day_attribution(
+        self, daily_candles: list[Candle]
+    ) -> None:
+        """엔진이 now 를 넘기면 거래소 체결 시각(exit_time)이 아니라 엔진 시계 날짜에 집계한다."""
+        rm = RiskManager(RiskConfig())
+        entry, exit_ = losing_pair(daily_candles)
+        rm.start_day(EQUITY, utc(2026, 10, 9) + timedelta(seconds=1))
+        t = make_trade(entry, exit_, 0.01)
+        t.exit_time = utc(2026, 10, 10) + timedelta(seconds=1)  # 거래소 시계가 앞서는 경우
+        rm.record_trade(t, now=utc(2026, 10, 9, 23, 59) + timedelta(seconds=59))
+        assert rm.current_day == utc(2026, 10, 9).date()
+        assert rm.daily_pnl == approx(t.pnl) and rm.day_start_equity == EQUITY
+        assert rm.to_dict()["day"] == "2026-10-09"
+
     def test_record_trade_on_new_day_resets_before_accumulating(self, daily_candles: list[Candle]) -> None:
         rm = RiskManager(RiskConfig())
         entry, exit_ = losing_pair(daily_candles)

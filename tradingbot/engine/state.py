@@ -353,14 +353,29 @@ class StateStore:
                     pass
         logger.debug("상태 저장: %s", self.path)
 
-    # ------------------------------------------------------------------
-    def _quarantine(self, why: str) -> None:
+    def archive(self, label: str) -> Path | None:
+        """현재 상태 파일을 ``{name}.{label}-{UTC 시각}`` 으로 옮겨 보관한다 (파일이 없거나 실패하면 None).
+
+        모드/브로커가 바뀐 상태 파일처럼 복원하지는 않지만 지우고 싶지도 않은 경우에 쓴다.
+        """
+        if not self.path.exists():
+            return None
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        backup = self.path.with_name(f"{self.path.name}.corrupt-{stamp}")
+        safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in label) or "backup"
+        backup = self.path.with_name(f"{self.path.name}.{safe}-{stamp}")
         try:
             os.replace(self.path, backup)
         except OSError as e:
-            logger.warning("손상된 상태 파일 %s 백업 실패 (%s): %s — 빈 상태로 시작", self.path, e, why)
+            logger.warning("상태 파일 %s 보관 실패 (%s): %s", self.path, backup.name, e)
+            return None
+        logger.info("상태 파일을 %s 로 보관했습니다", backup.name)
+        return backup
+
+    # ------------------------------------------------------------------
+    def _quarantine(self, why: str) -> None:
+        backup = self.archive("corrupt")
+        if backup is None:
+            logger.warning("손상된 상태 파일 %s 백업 실패 (%s) — 빈 상태로 시작", self.path, why)
             return
         logger.warning("손상된 상태 파일을 %s 로 옮기고 빈 상태로 시작합니다 (%s)", backup.name, why)
 

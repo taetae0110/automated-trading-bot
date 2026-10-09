@@ -163,9 +163,62 @@ ORDER_MARKET_DONE = {
 }
 
 
+# 개별 주문 조회 (GET /v1/order) 형식의 시장가 매수(금액 주문, ord_type=price). 공식 문서(주문 목록 조회의 state 설명):
+# "시장가 매수 주문은 체결 후 잔량이 발생하는 경우 cancel, 딱 맞아떨어지는 경우 done" — 5,000 KRW 주문이 0.00003 BTC
+# (4,800 KRW) 체결되고 호가 단위 미만의 잔돈 200 KRW 가 취소되어 state=cancel 로 끝난 정상 완료 주문. 금액 주문이라
+# volume 은 없고 price 는 주문 총액이다. identifier 는 2024-10-18 이후 생성된 주문에만 제공되는 응답 필드.
+ORDER_PRICE_CANCEL_FILLED = {
+    "market": "KRW-BTC",
+    "uuid": "9ca023a5-851b-4fec-9f0a-48cd83c2eaae",
+    "side": "bid",
+    "ord_type": "price",
+    "price": "5000",
+    "state": "cancel",
+    "created_at": "2025-08-09T16:44:00+09:00",
+    "remaining_volume": "0",
+    "executed_volume": "0.00003",
+    "reserved_fee": "2.5",
+    "remaining_fee": "0.1",
+    "paid_fee": "2.4",
+    "locked": "0",
+    "prevented_volume": "0",
+    "prevented_locked": "0",
+    "trades_count": 1,
+    "identifier": "e3b2b7a4-0d1c-4d7e-9a4e-6f5e2c1d0b9a",
+    "trades": [
+        {
+            "market": "KRW-BTC",
+            "uuid": "795dff29-bba6-49b2-baab-63473ab7931c",
+            "price": "160000000",
+            "volume": "0.00003",
+            "funds": "4800",
+            "trend": "up",
+            "created_at": "2025-08-09T16:44:00.597751+09:00",
+            "side": "bid",
+        }
+    ],
+}
+
+# POST /v1/orders 의 403 응답 예시 (공식 문서 new-order, "market offline error")
+MARKET_OFFLINE_403 = {
+    "error": {
+        "name": "market_offline",
+        "message": "시스템 점검 중입니다. 점검이 완료된 후에 다시 시도해주세요.",
+    }
+}
+
+
 def error_body(name: str | int, message: str = "") -> dict:
     """공식 오류 본문 형식 {"error": {"name", "message"}}."""
     return {"error": {"name": name, "message": message}}
+
+
+def pop_identifier(body: dict) -> str:
+    """주문 본문의 클라이언트 주문 ID(identifier) 를 꺼내 검증하고 돌려준다 (uuid4, 최대 64자)."""
+    identifier = body.pop("identifier")
+    assert isinstance(identifier, str) and len(identifier) <= 64
+    assert uuid.UUID(identifier).version == 4
+    return identifier
 
 
 # ----------------------------------------------------------------------------- 픽스처
@@ -338,6 +391,9 @@ class TestJwt:
             payload = decode_token(req)
         body = json.loads(req.body)
         assert req.headers["Content-Type"] == "application/json"
+        assert payload["query_hash"] == query_hash(body)  # identifier 를 포함한 본문 전체가 해시 대상
+        assert payload["query_hash_alg"] == "SHA512"
+        pop_identifier(body)
         assert body == {
             "market": "KRW-BTC",
             "side": "bid",
@@ -345,8 +401,6 @@ class TestJwt:
             "volume": "1",
             "price": "140000000",
         }
-        assert payload["query_hash"] == query_hash(body)
-        assert payload["query_hash_alg"] == "SHA512"
 
     def test_nonce_is_fresh_per_request(self, broker):
         with responses.RequestsMock() as rsps:
@@ -356,6 +410,69 @@ class TestJwt:
             n1 = decode_token(rsps.calls[0].request)["nonce"]
             n2 = decode_token(rsps.calls[1].request)["nonce"]
         assert n1 != n2
+
+    def test_retry_after_5xx_mints_fresh_nonce_per_attempt(self, broker):
+        """공식 문서: nonce 는 같은 요청을 반복해도 매번 새 값이어야 한다 (재사용 → 401 nonce_used).
+        HttpClient 의 GET 재시도 규칙은 유지하되 시도마다 새 JWT 를 보내야 한다."""
+        with responses.RequestsMock() as rsps:
+            rsps.get(f"{BASE}/v1/accounts", json={}, status=500)
+            rsps.get(f"{BASE}/v1/accounts", json=ACCOUNTS_EXAMPLE)
+            balances = broker.get_balances()
+            assert len(rsps.calls) == 2
+            auths = [c.request.headers["Authorization"] for c in rsps.calls]
+            payloads = [decode_token(c.request) for c in rsps.calls]
+        assert balances["KRW"].total == 1_000_000.0
+        assert auths[0] != auths[1]
+        assert payloads[0]["nonce"] != payloads[1]["nonce"]
+        assert all(uuid.UUID(p["nonce"]).version == 4 for p in payloads)
+
+    def test_retry_keeps_query_hash_but_changes_nonce(self, broker):
+        """쿼리가 있는 GET(/v1/order 폴링) 도 재시도마다 nonce 만 바뀌고 query_hash 는 같은 쿼리의 해시여야 한다."""
+        with responses.RequestsMock() as rsps:
+            rsps.get(f"{BASE}/v1/order", json={}, status=503)
+            rsps.get(f"{BASE}/v1/order", json=error_body(429, "Too Many Requests"), status=429)
+            rsps.get(f"{BASE}/v1/order", json=ORDER_MARKET_DONE)
+            order = broker.get_order(ORDER_MARKET_DONE["uuid"], "KRW-USDT")
+            assert len(rsps.calls) == 3
+            payloads = [decode_token(c.request) for c in rsps.calls]
+            urls = {c.request.url for c in rsps.calls}
+        assert order.status == OrderStatus.FILLED
+        assert len(urls) == 1 and urlsplit(urls.pop()).query == f"uuid={ORDER_MARKET_DONE['uuid']}"
+        assert len({p["nonce"] for p in payloads}) == 3
+        assert {p["query_hash"] for p in payloads} == {query_hash({"uuid": ORDER_MARKET_DONE["uuid"]})}
+
+    def test_retry_after_network_error_mints_fresh_nonce(self, broker):
+        """읽기 타임아웃은 서버가 이미 nonce 를 소비했을 수 있는 경우라 더더욱 새 토큰이어야 한다."""
+        with responses.RequestsMock() as rsps:
+            rsps.get(f"{BASE}/v1/accounts", body=requests.ReadTimeout("read timed out"))
+            rsps.get(f"{BASE}/v1/accounts", json=ACCOUNTS_EXAMPLE)
+            broker.get_balances()
+            nonces = [decode_token(c.request)["nonce"] for c in rsps.calls]
+        assert len(nonces) == 2 and nonces[0] != nonces[1]
+
+    def test_private_get_retry_budget_matches_http_client(self, broker):
+        """재시도 횟수는 HttpClient(max_retries) 와 같고, 모든 시도의 nonce 가 서로 다르다. 끝까지 429 면 RateLimitError."""
+        with responses.RequestsMock() as rsps:
+            rsps.get(f"{BASE}/v1/accounts", json=error_body("too_many_requests", "limit"), status=429)
+            with pytest.raises(RateLimitError):
+                broker.get_balances()
+            attempts = len(rsps.calls)
+            nonces = {decode_token(c.request)["nonce"] for c in rsps.calls}
+        assert attempts == broker._client.max_retries + 1 == 4
+        assert len(nonces) == attempts
+
+    def test_private_post_and_delete_are_single_shot(self, broker):
+        """주문/취소는 중복 접수 위험 때문에 재시도하지 않는다 (HttpClient 규칙과 동일)."""
+        with responses.RequestsMock() as rsps:
+            rsps.post(f"{BASE}/v1/orders", json={}, status=503)
+            with pytest.raises(BrokerError):
+                broker.place_order("KRW-BTC", OrderSide.BUY, 1, OrderType.LIMIT, price=140_000_000)
+            assert len(rsps.calls) == 1
+        with responses.RequestsMock() as rsps:
+            rsps.delete(f"{BASE}/v1/order", json={}, status=503)
+            with pytest.raises(BrokerError):
+                broker.cancel_order(ORDER_LIMIT_WAIT["uuid"])
+            assert len(rsps.calls) == 1
 
     def test_hs256_option(self):
         b = UpbitBroker(ACCESS, SECRET, jwt_algorithm="HS256")
@@ -820,6 +937,7 @@ class TestPlaceOrder:
             order = broker.place_order("KRW-BTC", OrderSide.BUY, qty)
             post = next(c.request for c in rsps.calls if c.request.method == "POST")
             body = json.loads(post.body)
+        pop_identifier(body)
         assert body == {
             "market": "KRW-BTC",
             "side": "bid",
@@ -873,7 +991,9 @@ class TestPlaceOrder:
             order = broker.place_order("KRW-USDT", OrderSide.SELL, 5.377594)
             post = next(c.request for c in rsps.calls if c.request.method == "POST")
             get = next(c.request for c in rsps.calls if c.request.method == "GET")
-        assert json.loads(post.body) == {
+        body = json.loads(post.body)
+        pop_identifier(body)
+        assert body == {
             "market": "KRW-USDT",
             "side": "ask",
             "ord_type": "market",
@@ -896,7 +1016,9 @@ class TestPlaceOrder:
                 "KRW-BTC", OrderSide.BUY, 1.000000001, OrderType.LIMIT, price=139_999_600
             )
             post = next(c.request for c in rsps.calls if c.request.method == "POST")
-        assert json.loads(post.body) == {
+        body = json.loads(post.body)
+        pop_identifier(body)
+        assert body == {
             "market": "KRW-BTC",
             "side": "bid",
             "ord_type": "limit",
@@ -909,6 +1031,98 @@ class TestPlaceOrder:
         )
         assert order.created_at == datetime(2025, 7, 4, 6, 0, tzinfo=timezone.utc)
         assert order.raw["locked"] == "140070000.0"
+
+    def test_identifier_is_unique_per_order(self, broker):
+        """공식 문서: identifier 는 계정 내 전체 주문 기준으로 고유해야 하며 재사용할 수 없다 → 주문마다 새 uuid4."""
+        with responses.RequestsMock() as rsps:
+            rsps.post(f"{BASE}/v1/orders", json=ORDER_LIMIT_WAIT, status=201)
+            rsps.get(f"{BASE}/v1/order", json=ORDER_LIMIT_WAIT)
+            broker.place_order("KRW-BTC", OrderSide.BUY, 1, OrderType.LIMIT, price=140_000_000)
+            broker.place_order("KRW-BTC", OrderSide.BUY, 1, OrderType.LIMIT, price=140_000_000)
+            ids = [
+                pop_identifier(json.loads(c.request.body)) for c in rsps.calls if c.request.method == "POST"
+            ]
+        assert len(ids) == 2 and ids[0] != ids[1]
+
+    @pytest.mark.parametrize(
+        "exc", [requests.ReadTimeout("read timed out"), requests.ConnectionError("connection reset")]
+    )
+    def test_lost_response_recovers_accepted_order_by_identifier(self, broker, real_btc_ticker_raw, exc):
+        """POST 응답을 받지 못했지만 거래소가 주문을 받은 경우: identifier 로 조회해 그 주문을 돌려준다
+        (GET /v1/order?identifier=, 공식 문서). 주문은 재전송하지 않는다."""
+
+        price = float(real_btc_ticker_raw[0]["trade_price"])
+        qty = broker.round_quantity("KRW-BTC", 2 * KRW_MIN_ORDER_VALUE / price)  # 약 10,000 KRW 어치
+        posted: dict = {}
+
+        def lookup(request):
+            qs = parse_qs(urlsplit(request.url).query)
+            assert list(qs) == ["identifier"]
+            # 거래소에 접수된 주문: 요청한 금액(price) 과 identifier 를 그대로 가진 개별 주문 조회 응답
+            raw = dict(ORDER_PRICE_CANCEL_FILLED, identifier=qs["identifier"][0], price=posted["price"])
+            return 200, {}, json.dumps(raw)
+
+        def failing_post(request):
+            posted.update(json.loads(request.body))
+            raise exc
+
+        with responses.RequestsMock() as rsps:
+            rsps.get(f"{BASE}/v1/ticker", json=real_btc_ticker_raw)
+            rsps.get(f"{BASE}/v1/orders/chance", json=CHANCE_EXAMPLE)
+            rsps.add_callback(responses.POST, f"{BASE}/v1/orders", callback=failing_post)
+            rsps.add_callback(responses.GET, f"{BASE}/v1/order", callback=lookup)
+            order = broker.place_order("KRW-BTC", OrderSide.BUY, qty)
+            posts = [c.request for c in rsps.calls if c.request.method == "POST"]
+            gets = [c.request for c in rsps.calls if "/v1/order?" in c.request.url]
+        assert len(posts) == 1 and len(gets) == 1
+        sent_identifier = pop_identifier(posted)
+        assert posted == {"market": "KRW-BTC", "side": "bid", "ord_type": "price", "price": posted["price"]}
+        assert float(posted["price"]) >= KRW_MIN_ORDER_VALUE
+        assert parse_qs(urlsplit(gets[0].url).query) == {"identifier": [sent_identifier]}
+        assert decode_token(gets[0])["query_hash"] == query_hash({"identifier": sent_identifier})
+        assert order.id == ORDER_PRICE_CANCEL_FILLED["uuid"]
+        assert order.raw["identifier"] == sent_identifier and order.raw["price"] == posted["price"]
+        assert order.status == OrderStatus.FILLED and order.is_filled
+        assert order.filled_quantity == 0.00003 and order.quantity == qty  # 금액 주문: 요청 수량을 기억
+        assert order.average_price == pytest.approx(160_000_000.0) and order.fee == 2.4
+        assert broker._requested_qty[order.id] == qty
+
+    def test_lost_response_with_order_not_found_reraises_network_error(self, broker):
+        """identifier 조회가 order_not_found 면 주문이 접수되지 않은 것 → 원래 네트워크 오류(status 없음)를 던진다."""
+        with responses.RequestsMock() as rsps:
+            rsps.post(f"{BASE}/v1/orders", body=requests.ReadTimeout("read timed out"))
+            rsps.get(
+                f"{BASE}/v1/order", json=error_body("order_not_found", "주문을 찾지 못했습니다."), status=404
+            )
+            with pytest.raises(BrokerError) as ei:
+                broker.place_order("KRW-BTC", OrderSide.BUY, 1, OrderType.LIMIT, price=140_000_000)
+            assert [c.request.method for c in rsps.calls] == ["POST", "GET"]
+        assert type(ei.value) is BrokerError and ei.value.status_code is None
+        assert "네트워크 오류" in str(ei.value) and "read timed out" in str(ei.value)
+
+    def test_lost_response_with_failed_lookup_stays_unknown(self, broker):
+        """접수 여부 확인 자체가 실패하면 status 없는 BrokerError (엔진이 '결과 미확인' 으로 거래소 기준 확정)."""
+        with responses.RequestsMock() as rsps:
+            rsps.post(f"{BASE}/v1/orders", body=requests.ConnectionError("reset"))
+            rsps.get(f"{BASE}/v1/order", json={}, status=502)
+            with pytest.raises(BrokerError) as ei:
+                broker.place_order("KRW-BTC", OrderSide.BUY, 1, OrderType.LIMIT, price=140_000_000)
+            gets = [c for c in rsps.calls if c.request.method == "GET"]
+            assert len(gets) == broker._client.max_retries + 1  # 조회(GET) 는 재시도, 주문(POST) 은 1회
+            assert sum(c.request.method == "POST" for c in rsps.calls) == 1
+        assert type(ei.value) is BrokerError and ei.value.status_code is None
+        assert "접수 여부 확인 실패" in str(ei.value) and "HTTP 502" in str(ei.value)
+        assert isinstance(ei.value.__cause__, BrokerError) and ei.value.__cause__.status_code is None
+
+    def test_http_error_on_post_is_not_recovered(self, broker):
+        """거래소가 명시적으로 거부한 주문(HTTP 오류 응답) 은 접수되지 않았으므로 identifier 조회를 하지 않는다."""
+        with responses.RequestsMock() as rsps:
+            rsps.post(
+                f"{BASE}/v1/orders", json=error_body("under_min_total_bid", "최소 주문 금액"), status=400
+            )
+            with pytest.raises(OrderError):
+                broker.place_order("KRW-BTC", OrderSide.BUY, 1, OrderType.LIMIT, price=140_000_000)
+            assert len(rsps.calls) == 1
 
     def test_order_throttle_group_is_order(self, broker, monkeypatch):
         waited: list[str] = []
@@ -946,11 +1160,65 @@ class TestOrderStatusMapping:
         assert o.status == OrderStatus.PARTIALLY_FILLED
 
     def test_cancel(self, broker):
+        """지정가의 cancel 은 체결분이 있어도 CANCELED (사용자/엔진 취소)."""
         o = self._parse(broker, state="cancel", executed_volume="0.2")
         assert o.status == OrderStatus.CANCELED and o.status.is_terminal and o.filled_quantity == 0.2
 
+    def test_market_buy_cancel_after_fill_is_filled(self, broker):
+        """공식 문서: 시장가 매수(ord_type=price) 는 체결 후 잔량이 남으면 cancel, 딱 맞으면 done 으로 끝난다.
+        price 는 정수 원으로 내림되므로 봇의 매수는 거의 항상 cancel 로 끝난다 → 정상 완료(FILLED) 로 판정해야 한다."""
+        broker._remember_qty(ORDER_PRICE_CANCEL_FILLED["uuid"], 0.00003)
+        o = broker._parse_order(json.loads(json.dumps(ORDER_PRICE_CANCEL_FILLED)))
+        assert o.status == OrderStatus.FILLED and o.is_filled and o.status.is_terminal
+        assert o.side == OrderSide.BUY and o.type == OrderType.MARKET and o.price is None
+        assert o.quantity == 0.00003 and o.filled_quantity == 0.00003
+        assert o.average_price == pytest.approx(4800 / 0.00003) and o.fee == 2.4
+        # 딱 맞아떨어진 done 과 같은 결과
+        done = broker._parse_order(dict(ORDER_PRICE_CANCEL_FILLED, state="done"))
+        assert done.status == OrderStatus.FILLED
+        # 체결 없이 취소된 금액 주문은 CANCELED
+        raw = dict(ORDER_PRICE_CANCEL_FILLED, executed_volume="0", trades_count=0, trades=[], paid_fee="0")
+        assert broker._parse_order(raw).status == OrderStatus.CANCELED
+
+    def test_market_sell_cancel_with_partial_fill(self, broker):
+        """시장가 매도(ord_type=market, volume 있음) 가 일부만 체결되고 잔량이 취소되면 PARTIALLY_FILLED, 전량이면 FILLED."""
+        raw = json.loads(json.dumps(ORDER_MARKET_DONE))
+        raw.update(state="cancel", executed_volume="3.0", remaining_volume="2.377594")
+        raw["trades"][0].update(volume="3.0", funds="4125")
+        o = broker._parse_order(raw)
+        assert o.status == OrderStatus.PARTIALLY_FILLED and o.filled_quantity == 3.0
+        assert o.remaining_quantity == pytest.approx(2.377594)
+        full = dict(ORDER_MARKET_DONE, state="cancel")
+        assert broker._parse_order(full).status == OrderStatus.FILLED
+
+    def test_market_buy_cancel_after_fill_via_place_order(self, broker, real_btc_ticker_raw):
+        """접수(wait) → 조회에서 cancel+체결 로 끝난 시장가 매수가 place_order 에서 체결된 주문으로 돌아온다."""
+        price = float(real_btc_ticker_raw[0]["trade_price"])
+        qty = broker.round_quantity("KRW-BTC", 2 * KRW_MIN_ORDER_VALUE / price)  # 약 10,000 KRW 어치
+        accepted = dict(ORDER_PRICE_CANCEL_FILLED, state="wait", executed_volume="0", trades_count=0)
+        accepted.pop("trades")
+        with responses.RequestsMock() as rsps:
+            rsps.get(f"{BASE}/v1/ticker", json=real_btc_ticker_raw)
+            rsps.get(f"{BASE}/v1/orders/chance", json=CHANCE_EXAMPLE)
+            rsps.post(f"{BASE}/v1/orders", json=accepted, status=201)
+            rsps.get(f"{BASE}/v1/order", json=ORDER_PRICE_CANCEL_FILLED)
+            order = broker.place_order("KRW-BTC", OrderSide.BUY, qty)
+        assert order.status == OrderStatus.FILLED and order.is_filled
+        assert order.filled_quantity == 0.00003 and order.quantity == qty
+        assert order.raw["state"] == "cancel"
+
     def test_unknown_state_pending(self, broker):
         assert self._parse(broker, state="mystery").status == OrderStatus.PENDING
+
+    def test_map_state_signature_uses_ord_type(self):
+        m = UpbitBroker._map_state
+        assert m("cancel", "price", None, 0.00003) == OrderStatus.FILLED
+        assert m("cancel", "price", None, 0.0) == OrderStatus.CANCELED
+        assert m("cancel", "market", 5.0, 5.0) == OrderStatus.FILLED
+        assert m("cancel", "market", 5.0, 2.0) == OrderStatus.PARTIALLY_FILLED
+        assert m("cancel", "limit", 1.0, 0.5) == OrderStatus.CANCELED
+        assert m("cancel", "limit", 1.0, 0.0) == OrderStatus.CANCELED
+        assert m("done", "price", None, 0.00003) == OrderStatus.FILLED
 
     def test_price_order_without_volume_uses_remembered_quantity(self, broker):
         raw = json.loads(json.dumps(ORDER_LIMIT_WAIT))
@@ -1016,6 +1284,46 @@ class TestOrderQueries:
             )
             assert broker.cancel_order("nope") is False
 
+    def test_get_and_cancel_order_by_identifier(self, broker):
+        """공식 문서: GET/DELETE /v1/order 는 uuid 또는 identifier 중 하나로 지정 (둘 다면 uuid 기준)."""
+        ident = ORDER_PRICE_CANCEL_FILLED["identifier"]
+        with responses.RequestsMock() as rsps:
+            rsps.get(f"{BASE}/v1/order", json=ORDER_PRICE_CANCEL_FILLED)
+            o = broker.get_order(identifier=ident)
+            req = rsps.calls[0].request
+            payload = decode_token(req)
+        assert urlsplit(req.url).query == f"identifier={ident}"
+        assert payload["query_hash"] == query_hash({"identifier": ident})
+        assert o.id == ORDER_PRICE_CANCEL_FILLED["uuid"] and o.raw["identifier"] == ident
+        with responses.RequestsMock() as rsps:
+            rsps.get(f"{BASE}/v1/order", json=ORDER_PRICE_CANCEL_FILLED)
+            broker.get_order(ORDER_PRICE_CANCEL_FILLED["uuid"], "KRW-BTC", identifier=ident)
+            req = rsps.calls[0].request
+        assert parse_qs(urlsplit(req.url).query) == {
+            "uuid": [ORDER_PRICE_CANCEL_FILLED["uuid"]],
+            "identifier": [ident],
+        }
+        with responses.RequestsMock() as rsps:
+            rsps.delete(f"{BASE}/v1/order", json=dict(ORDER_LIMIT_WAIT, state="cancel"))
+            assert broker.cancel_order(identifier=ident) is True
+            req = rsps.calls[0].request
+            payload = decode_token(req)
+        assert req.method == "DELETE" and urlsplit(req.url).query == f"identifier={ident}"
+        assert payload["query_hash"] == query_hash({"identifier": ident})
+        with responses.RequestsMock() as rsps:
+            rsps.delete(
+                f"{BASE}/v1/order", json=error_body("order_not_found", "주문을 찾지 못했습니다."), status=404
+            )
+            assert broker.cancel_order(identifier=ident) is False
+
+    def test_order_lookup_requires_uuid_or_identifier(self, broker):
+        with responses.RequestsMock() as rsps:
+            with pytest.raises(OrderError):
+                broker.get_order()
+            with pytest.raises(OrderError):
+                broker.cancel_order("", "KRW-BTC")
+            assert len(rsps.calls) == 0
+
     def test_cancel_order_other_error_raises(self, broker):
         with responses.RequestsMock() as rsps:
             rsps.delete(f"{BASE}/v1/order", json=error_body("invalid_parameter", "bad"), status=400)
@@ -1050,6 +1358,9 @@ class TestErrorMapping:
             (401, "jwt_verification", AuthenticationError),
             (401, "nonce_used", AuthenticationError),
             (403, "out_of_scope", AuthenticationError),
+            (401, "out_of_scope", AuthenticationError),  # 안내 문서: out_of_scope 만 401/403 둘 다 가능
+            (403, None, AuthenticationError),  # 이름을 모르면 상태 코드 기준
+            (403, "market_offline", OrderError),  # 주문 API 문서의 403 = 시스템 점검, 인증 오류가 아니다
             (429, "too_many_requests", RateLimitError),
             (418, None, RateLimitError),
             (500, None, BrokerError),
@@ -1066,6 +1377,15 @@ class TestErrorMapping:
         if name:
             assert name in str(ei.value)
         assert type(ei.value) is exc
+
+    def test_market_offline_official_body_is_order_error_not_auth(self, broker):
+        """공식 new-order 문서의 403 예시 본문 그대로: 점검 중인 마켓은 OrderError 여야 운영자가 키 문제로 오해하지 않는다."""
+        with responses.RequestsMock() as rsps:
+            rsps.post(f"{BASE}/v1/orders", json=MARKET_OFFLINE_403, status=403)
+            with pytest.raises(OrderError) as ei:
+                broker.place_order("KRW-BTC", OrderSide.BUY, 1, OrderType.LIMIT, price=140_000_000)
+        assert not isinstance(ei.value, AuthenticationError)
+        assert ei.value.status_code == 403 and "market_offline" in str(ei.value) and "점검" in str(ei.value)
 
     def test_non_order_endpoint_400_is_plain_broker_error(self, broker):
         with responses.RequestsMock() as rsps:

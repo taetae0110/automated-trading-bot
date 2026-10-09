@@ -16,20 +16,24 @@ bar 알고리즘 (심볼별 timestamp 합집합을 시간순으로):
       산정하므로 갭 상승으로 자금이 모자라는 일이 없다.
    d. 리스크 청산(bar 중): 시가 → 저가 → 고가(최고가 갱신) → 저가(갱신된 고점 기준 추적손절) 순으로
       ``risk.check_exit`` 를 호출해 갭이면 시가, 아니면 손절/익절/추적 레벨에 체결한다 (손절 우선).
-      이 bar 중간(STOP/LIMIT 트리거)에 진입한 포지션은 체결 이후의 가격 경로를 알 수 없으므로
-      종가에서만 판정한다.
+      이 bar 중간에 진입한 포지션 — STOP 은 트리거가 시가보다 높을 때, LIMIT 매수는 지정가가 시가보다
+      낮아 지정가에 체결됐을 때 — 은 체결 이후의 가격 경로를 알 수 없으므로 종가에서만 판정한다.
+      시가에 체결된 진입(갭 통과 STOP, 시가 이하 지정가의 LIMIT, MARKET) 은 bar 전체를 판정한다.
 3. bar 종료 — ``mark_price(sym, close)``: (bar 중 진입 포지션의 종가 리스크 판정) → ``signal_at`` →
    BUY & 포지션 없음 & ``risk.can_open`` & 예산 > 0 → ``fill_on == "close"`` 면 즉시 시장가 체결,
    아니면 다음 bar 대기 주문. STOP/LIMIT 매수는 항상 다음 bar. SELL & 포지션 있음 → 같은 규칙.
    포지션 보유 중 BUY 와 포지션 없는 SELL 은 무시한다 (단, 다음 bar 시가에 ``max_holding_bars`` 로
    청산될 포지션은 "없음" 으로 간주해 재진입 신호를 받는다 — 엔진 §6 a→b→d 순서와 동일).
-4. bar 종료 자산(equity) 기록. 마지막 bar 의 잔여 포지션은 종가로 평가만 한다.
+4. bar 종료 자산(equity) 기록. 마지막 bar 의 잔여 포지션은 종가로 평가만 한다. 성과 지표는 초기 현금을
+   자산 곡선의 기준점(``compute_metrics(initial_equity=)``) 으로 삼아 bar 0 체결의 손익도 반영하므로
+   ``metrics["total_return"] == final_equity / initial_cash - 1`` 이다.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import numbers
 from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -76,6 +80,35 @@ SKIP_ALREADY_HELD = "대기 주문 실행 시 이미 보유"
 
 #: 청산 사유 접두어
 REASON_MAX_HOLDING = "최대 보유 기간 만료"
+
+
+# ---------------------------------------------------------------------------- 신호 해석 헬퍼
+def _parse_max_holding_bars(value: Any, symbol: str) -> int | None:
+    """``Signal.max_holding_bars`` → 양의 정수, 제한이 없으면 None.
+
+    엔진(``Trader._max_holding_bars``) 과 같이 ``int()`` 로 해석하므로 numpy 정수(``df["col"].iat[i]`` 가
+    돌려주는 ``np.int64``), 정수값 실수(``3.0``), 숫자 문자열도 받는다. bool, 소수점이 있는 실수, 해석 불가
+    값, 0 이하는 **경고 후** None 으로 둔다 — 조용히 버리면 모의/실거래는 만료 청산하는데 백테스트만
+    포지션을 영원히 들고 있는 식으로 갈라진다.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        logger.warning("%s max_holding_bars=%r 는 bool 이라 무시합니다 (보유 기간 제한 없음)", symbol, value)
+        return None
+    try:
+        if isinstance(value, numbers.Real) and not float(value).is_integer():
+            raise ValueError("정수가 아닙니다")
+        n = int(value)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning(
+            "%s max_holding_bars=%r 를 정수로 해석할 수 없어 무시합니다 (보유 기간 제한 없음)", symbol, value
+        )
+        return None
+    if n <= 0:
+        logger.warning("%s max_holding_bars=%r 는 0 이하라 무시합니다 (보유 기간 제한 없음)", symbol, value)
+        return None
+    return n
 
 
 # ---------------------------------------------------------------------------- 직렬화 헬퍼
@@ -556,6 +589,7 @@ class Backtester:
             trades,
             periods_per_year(self.interval, self.asset_class),
             exposure=exposure,
+            initial_equity=self.initial_cash,
         )
         open_positions = [replace(p, meta=dict(p.meta)) for p in broker.get_positions().values()]
         result = BacktestResult(
@@ -793,8 +827,7 @@ class Backtester:
         if filled:
             fill = filled[0]
             if side == OrderSide.BUY:
-                trigger = fill.raw.get("trigger", fill.price)
-                intrabar = trigger is not None and float(trigger) > float(sd.open[i])
+                intrabar = self._filled_after_open(fill, float(sd.open[i]))
                 self._on_entry_fill(sd, i, ts, sig, fill, intrabar=intrabar)
             else:
                 self._state[sd.symbol].clear_entry()
@@ -806,6 +839,24 @@ class Backtester:
         elif final.status == OrderStatus.REJECTED:
             self._rejected += 1
             logger.warning("%s 주문 %s 거부: %s", sd.symbol, order.id, final.raw.get("reject_reason", ""))
+
+    @staticmethod
+    def _filled_after_open(fill: Order, open_px: float) -> bool:
+        """매수 체결이 bar 시가 **이후**(bar 중간) 에 일어났는지.
+
+        - STOP : 트리거가 시가보다 높을 때만 (시가 >= 트리거면 시가 체결 = 갭 통과).
+        - LIMIT: 체결가가 시가보다 낮을 때만. PaperBroker 는 ``min(지정가, 시가)`` 에 체결하므로 지정가가
+          시가 아래일 때 가격이 내려와 닿은 뒤에야 체결된 것이고, 시가 이하의 지정가는 시가에 체결된다.
+        bar 중간 체결이면 그 이후의 low/high 순서를 알 수 없어 종가에서만 리스크 판정하고, 시가 체결이면
+        bar 전체 경로를 알고 있으므로 bar 내 손절/익절 판정을 그대로 한다. 거꾸로 분류하면 시가 아래 체결을
+        이미 지나간 시가로 익절하는 미래 참조가 생긴다.
+        """
+        if fill.type == OrderType.STOP:
+            trigger = fill.raw.get("trigger")
+            return trigger is not None and float(trigger) > open_px
+        if fill.type == OrderType.LIMIT:
+            return fill.average_price is not None and float(fill.average_price) < open_px
+        return False
 
     def _on_entry_fill(
         self, sd: _SymbolData, i: int, ts: datetime, sig: Signal, order: Order, *, intrabar: bool
@@ -819,17 +870,14 @@ class Backtester:
         st = self._state[sd.symbol]
         st.entry_bar = i
         st.entry_intrabar = intrabar
-        hold = sig.max_holding_bars
-        st.max_holding_bars = (
-            int(hold) if isinstance(hold, int) and not isinstance(hold, bool) and hold > 0 else None
-        )
+        st.max_holding_bars = _parse_max_holding_bars(sig.max_holding_bars, sd.symbol)
         logger.debug(
             "%s 진입 bar=%d price=%.8g intrabar=%s max_holding=%s",
             sd.symbol,
             i,
             order.average_price,
             intrabar,
-            sig.max_holding_bars,
+            st.max_holding_bars,
         )
 
     # ------------------------------------------------------------------ 2-d. 리스크 청산 (bar 중)

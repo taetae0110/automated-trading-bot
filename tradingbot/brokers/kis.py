@@ -28,8 +28,13 @@
 - 취소 ``order-rvsecncl`` (TTTC0013U / VTTC0013U) — KRX_FWDG_ORD_ORGNO(주문 응답) + ORGN_ODNO 필요.
   잔량 전부 취소: QTY_ALL_ORD_YN=Y, ORD_QTY=0.
 - 잔고 ``inquire-balance`` (TTTC8434R / VTTC8434R, ctx_area_fk100/nk100 + tr_cont 연속조회).
+- 매수가능조회 ``inquire-psbl-order`` (TTTC8908R / VTTC8908R): 매수 주문 직전에 호출해 수량을
+  ``nrcvb_buy_qty``(미수없는매수수량) 이하로 맞춘다. 시장가 주문은 ORD_UNPR 없이 나가므로 서버가 **상한가 × 수량**을
+  주문가능금액에서 잡는다 (공식 order_cash 안내: "ORD_UNPR 이 없는 주문은 상한가로 주문금액을 선정"). 현재가로
+  사이징한 수량을 그대로 보내면 예수금의 약 77% 를 넘는 순간 APBK0918(주문가능금액 초과) 로 거부된다.
 - 주문 조회 ``inquire-daily-ccld`` (TTTC0081R / VTTC0081R, 최근 3개월).
 - 휴장일 ``chk-holiday`` (CTCA0903R, 일 1회 권장 → 일자별 캐시).
+- 호출 간격: 공식 샘플(kis_auth.py)과 같이 실전 0.05초, 모의 0.5초 (``request_interval`` 로 조정).
 """
 
 from __future__ import annotations
@@ -91,6 +96,7 @@ PATH_PAST_MINUTE_CHART = "/uapi/domestic-stock/v1/quotations/inquire-time-dailyc
 PATH_ORDER_CASH = "/uapi/domestic-stock/v1/trading/order-cash"
 PATH_ORDER_RVSECNCL = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
 PATH_BALANCE = "/uapi/domestic-stock/v1/trading/inquire-balance"
+PATH_PSBL_ORDER = "/uapi/domestic-stock/v1/trading/inquire-psbl-order"
 PATH_DAILY_CCLD = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 PATH_HOLIDAY = "/uapi/domestic-stock/v1/quotations/chk-holiday"
 
@@ -107,6 +113,7 @@ _TR_IDS: dict[str, dict[str, str]] = {
         "sell": "TTTC0011U",
         "cancel": "TTTC0013U",
         "balance": "TTTC8434R",
+        "psbl_order": "TTTC8908R",
         "daily_ccld": "TTTC0081R",
     },
     "paper": {
@@ -114,6 +121,7 @@ _TR_IDS: dict[str, dict[str, str]] = {
         "sell": "VTTC0011U",
         "cancel": "VTTC0013U",
         "balance": "VTTC8434R",
+        "psbl_order": "VTTC8908R",
         "daily_ccld": "VTTC0081R",
     },
 }
@@ -143,6 +151,9 @@ BALANCE_MAX_PAGES = 20
 CCLD_MAX_PAGES = 30
 ORDER_LOOKUP_DAYS = 7
 RATE_LIMIT_RETRIES = 3
+# 연속 호출 최소 간격(초). 공식 샘플 kis_auth.py: 실전 0.05s, 모의 0.5s (모의 서버는 초당 한도가 낮다)
+REAL_REQUEST_INTERVAL = 0.05
+PAPER_REQUEST_INTERVAL = 0.5
 
 # KRX 호가단위 (2023-01-25 통합, 코스피/코스닥 동일): (미만 가격, 호가단위)
 KRX_TICK_TABLE: tuple[tuple[int, int], ...] = (
@@ -262,6 +273,24 @@ class _Bucket:
     volume: float
 
 
+@dataclass(frozen=True)
+class KISBuyingPower:
+    """매수가능조회(``inquire-psbl-order``, TTTC8908R / VTTC8908R) 결과. 금액은 KRW, 수량은 주.
+
+    미수를 쓰지 않으므로 ``amount``/``quantity``(미수없는매수금액/수량) 가 기준값이다. 시장가(ORD_DVSN=01) 조회의
+    ``calc_price`` 는 상한가다 — 시장가 주문은 ORD_UNPR 없이 나가 서버가 상한가 × 수량을 주문가능금액에서 잡는다.
+    """
+
+    symbol: str
+    cash: float  # ord_psbl_cash 주문가능현금
+    amount: float  # nrcvb_buy_amt 미수없는매수금액
+    quantity: int  # nrcvb_buy_qty 미수없는매수수량
+    max_amount: float  # max_buy_amt 최대매수금액 (미수 포함)
+    max_quantity: int  # max_buy_qty 최대매수수량 (미수 포함)
+    calc_price: float | None  # psbl_qty_calc_unpr 가능수량계산단가
+    raw: dict[str, Any]
+
+
 # ----------------------------------------------------------------------------- 브로커
 class KISBroker(BaseBroker):
     """한국투자증권 KIS Developers 국내주식 어댑터. 심볼은 6자리 종목코드 (예: 005930)."""
@@ -296,9 +325,11 @@ class KISBroker(BaseBroker):
         self._client = client or HttpClient(self._base_url, timeout=timeout)
         self._timeout = float(client.timeout) if client is not None else float(timeout)
         self._user_agent = user_agent or DEFAULT_USER_AGENT
-        # 모의투자 서버는 초당 호출 한도가 낮다 (공식 샘플: 실전 0.05s, 모의 0.5s)
+        # 모의투자 서버는 초당 호출 한도가 낮다. 공식 샘플(kis_auth.py)과 동일하게 실전 0.05s, 모의 0.5s.
         self._request_interval = (
-            (0.25 if self.sandbox else 0.05) if request_interval is None else request_interval
+            (PAPER_REQUEST_INTERVAL if self.sandbox else REAL_REQUEST_INTERVAL)
+            if request_interval is None
+            else float(request_interval)
         )
         self._holiday_check = bool(holiday_check)
         self._last_request_at = 0.0
@@ -371,6 +402,11 @@ class KISBroker(BaseBroker):
     @property
     def token_path(self) -> Path:
         return self._token_path
+
+    @property
+    def request_interval(self) -> float:
+        """연속 호출 사이 최소 간격(초). 기본 실전 0.05s, 모의 0.5s (공식 샘플 kis_auth.py 와 동일)."""
+        return self._request_interval
 
     def _tr(self, key: str) -> str:
         return _TR_IDS[self._env][key]
@@ -1097,7 +1133,11 @@ class KISBroker(BaseBroker):
         return holdings, summary
 
     def get_balances(self) -> dict[str, Balance]:
-        """KRW 예수금. total=예수금총금액(dnca_tot_amt), available=D+2 가수도정산금액(prvs_rcdl_excc_amt)."""
+        """KRW 예수금. total=예수금총금액(dnca_tot_amt), available=D+2 가수도정산금액(prvs_rcdl_excc_amt).
+
+        ``available`` 은 주문에 쓸 수 있는 현금의 상한일 뿐이다. 시장가 매수는 서버가 상한가 × 수량을 주문가능금액에서
+        잡으므로 실제 매수 가능 수량은 ``place_order`` 가 매수가능조회(``get_buying_power``) 로 맞춘다.
+        """
         _, summary = self._inquire_balance()
         total = _to_float(summary.get("dnca_tot_amt"))
         available = _to_float(summary.get("prvs_rcdl_excc_amt"))
@@ -1160,6 +1200,96 @@ class KISBroker(BaseBroker):
             value += ev
         return cash + value
 
+    # ------------------------------------------------------------------ 매수가능조회
+    def get_buying_power(
+        self, symbol: str, order_type: OrderType = OrderType.MARKET, price: float | None = None
+    ) -> KISBuyingPower:
+        """매수가능조회 (``inquire-psbl-order``, 실전 TTTC8908R / 모의 VTTC8908R). 한 번에 한 종목.
+
+        시장가는 공식 안내대로 ``ORD_DVSN=01`` + ``ORD_UNPR`` 공란으로 조회해 종목증거금율·상한가가 반영된 수량을
+        받고, 지정가는 ``ORD_DVSN=00`` + 호가단위로 반올림한 단가로 조회한다. CMA 평가금액/해외 자산은 포함하지 않는다.
+        """
+        sym = self._check_symbol(symbol)
+        order_type = OrderType(order_type)
+        self._require_account()
+        assert self._cano and self._acnt_prdt_cd
+        if order_type == OrderType.MARKET:
+            ord_dvsn, ord_unpr = "01", ""
+        elif order_type == OrderType.LIMIT:
+            if price is None:
+                raise OrderError("지정가 매수가능조회에는 price 가 필요합니다")
+            ord_dvsn, ord_unpr = "00", str(int(self.round_price(sym, price)))
+        else:
+            raise OrderError(f"매수가능조회를 지원하지 않는 주문 유형: {order_type}")
+        params = {
+            "CANO": self._cano,
+            "ACNT_PRDT_CD": self._acnt_prdt_cd,
+            "PDNO": sym,
+            "ORD_UNPR": ord_unpr,
+            "ORD_DVSN": ord_dvsn,
+            "CMA_EVLU_AMT_ICLD_YN": "N",
+            "OVRS_ICLD_YN": "N",
+        }
+        res = self._call("GET", PATH_PSBL_ORDER, self._tr("psbl_order"), params=params)
+        raw_out = res.body.get("output") or {}
+        out = _lower_keys(raw_out) if isinstance(raw_out, dict) else {}
+        amount = _to_float(out.get("nrcvb_buy_amt"))
+        quantity = _to_float(out.get("nrcvb_buy_qty"))
+        if amount is None or quantity is None:
+            raise BrokerError(
+                f"{sym} 매수가능조회 응답에 nrcvb_buy_amt/nrcvb_buy_qty 가 없습니다", payload=res.body
+            )
+        cash = _to_float(out.get("ord_psbl_cash"))
+        max_amount = _to_float(out.get("max_buy_amt"))
+        max_quantity = _to_float(out.get("max_buy_qty"))
+        calc_price = _to_float(out.get("psbl_qty_calc_unpr"))
+        return KISBuyingPower(
+            symbol=sym,
+            cash=cash if cash is not None else amount,
+            amount=amount,
+            quantity=max(int(quantity), 0),
+            max_amount=max_amount if max_amount is not None else amount,
+            max_quantity=max(int(max_quantity), 0) if max_quantity is not None else max(int(quantity), 0),
+            calc_price=calc_price if calc_price is not None and calc_price > 0 else None,
+            raw=dict(raw_out) if isinstance(raw_out, dict) else {},
+        )
+
+    def _cap_buy_quantity(self, sym: str, qty: int, order_type: OrderType, price: float | None) -> int:
+        """매수 수량을 서버가 계산한 매수가능수량(nrcvb_buy_qty) 이하로 맞춘다.
+
+        시장가 매수는 ORD_UNPR=0 으로 나가고 서버는 상한가 × 수량을 주문가능금액에서 잡는다 (공식 order_cash 안내:
+        "ORD_UNPR 이 없는 주문은 상한가로 주문금액을 선정"). 현재가로 사이징한 수량은 예수금의 약 77% 를 넘는 순간
+        APBK0918(주문가능금액 초과) 로 거부되므로, 공식 안내대로 주문 전에 매수가능조회(ORD_DVSN=01) 로 수량을 맞춘다.
+        조회 자체가 실패하면(인증 오류 제외) 경고만 남기고 요청 수량을 그대로 보낸다 — 최종 판정은 서버가 한다.
+        """
+        try:
+            bp = self.get_buying_power(sym, order_type, price)
+        except AuthenticationError:
+            raise
+        except BrokerError as e:
+            logger.warning("KIS %s 매수가능조회 실패 → 요청 수량 %d주 그대로 주문합니다: %s", sym, qty, e)
+            return qty
+        basis = "시장가(상한가 기준)" if order_type == OrderType.MARKET else "지정가"
+        calc = f"{bp.calc_price:,.0f}" if bp.calc_price else "-"
+        if bp.quantity < 1:
+            raise InsufficientFunds(
+                f"{sym} 매수가능수량 0주 ({basis}, 계산단가 {calc}, 주문가능현금 {bp.cash:,.0f} KRW, "
+                f"미수없는매수금액 {bp.amount:,.0f} KRW)",
+                payload=bp.raw,
+            )
+        if qty > bp.quantity:
+            logger.warning(
+                "KIS %s 매수 수량 %d주 → 매수가능수량 %d주로 축소 (%s, 계산단가 %s, 미수없는매수금액 %s KRW)",
+                sym,
+                qty,
+                bp.quantity,
+                basis,
+                calc,
+                f"{bp.amount:,.0f}",
+            )
+            return bp.quantity
+        return qty
+
     # ------------------------------------------------------------------ 주문
     def place_order(
         self,
@@ -1189,6 +1319,8 @@ class KISBroker(BaseBroker):
             ord_dvsn, ord_unpr = "00", str(int(px))
         else:  # pragma: no cover - enum 확장 대비
             raise OrderError(f"지원하지 않는 주문 유형: {order_type}")
+        if side == OrderSide.BUY:
+            qty = self._cap_buy_quantity(sym, qty, order_type, px)
 
         tr_id = self._tr("buy" if side == OrderSide.BUY else "sell")
         body = {
@@ -1426,4 +1558,4 @@ class KISBroker(BaseBroker):
         return True
 
 
-__all__ = ["KISBroker", "krx_tick_size", "round_to_tick"]
+__all__ = ["KISBroker", "KISBuyingPower", "krx_tick_size", "round_to_tick"]

@@ -15,10 +15,18 @@
   ``market.ask.min_total``, ``market.max_total``, ``bid_types/ask_types``.
 - 주문: ``POST /v1/orders`` (JSON 본문, order 그룹 12회/초/포켓). 시장가 매수 ``ord_type=price`` + ``price``(총액),
   시장가 매도 ``ord_type=market`` + ``volume``, 지정가 ``ord_type=limit`` + ``volume`` + ``price``.
-  ``GET /v1/order?uuid=`` (trades 포함), ``DELETE /v1/order?uuid=``, ``GET /v1/orders/open`` (``states[]``,
-  ``limit`` 최대 100, ``page``) 는 default 그룹 30회/초/포켓. 주문 상태 ``wait/watch/done/cancel``.
+  ``identifier``(선택, 계정 내 고유, 최대 64자) 는 클라이언트 주문 ID 로, 조회/취소에 ``uuid`` 대신 쓸 수 있다
+  (둘 다 보내면 uuid 기준). 이 어댑터는 주문마다 uuid4 identifier 를 보내고, 응답을 받지 못한 주문을 이것으로 찾는다.
+  ``GET /v1/order?uuid=|identifier=`` (trades 포함), ``DELETE /v1/order?uuid=|identifier=``, ``GET /v1/orders/open``
+  (``states[]``, ``limit`` 최대 100, ``page``) 는 default 그룹 30회/초/포켓. 주문 상태 ``wait/watch/done/cancel``.
+  시장가 매수(``price``)는 체결 후 잔량(호가 단위 미만의 잔돈)이 남으면 ``cancel``, 딱 맞아떨어지면 ``done`` 으로 끝난다
+  (주문 목록 조회 문서의 state 설명) — 즉 ``cancel`` 이 금액 주문의 정상 완료 상태다.
+- nonce 는 **요청마다** 새 UUID 여야 한다 (같은 요청을 재시도해도 새 값; 재사용 시 401 ``nonce_used``).
+  따라서 재시도 때마다 JWT 를 새로 만든다.
 - 오류 본문 ``{"error": {"name": ..., "message": ...}}`` (시세 API 는 name 이 정수). 429 = 초당 한도 초과,
-  418 = 반복 위반으로 일시 차단. ``Remaining-Req: group=default; min=1800; sec=29`` 헤더 (``min`` 은 deprecated).
+  418 = 반복 위반으로 일시 차단. 오류 분류는 HTTP 상태만이 아니라 ``error.name`` 을 함께 본다 (예: 주문 API 의
+  403 ``market_offline`` = 시스템 점검, 401/403 ``out_of_scope`` = 권한 없음).
+  ``Remaining-Req: group=default; min=1800; sec=29`` 헤더 (``min`` 은 deprecated).
 - 원화 마켓 호가 단위 표(docs.upbit.com/kr/docs/krw-market-info, 2025-07-31 개정): 아래 ``KRW_TICK_TABLE``.
   최소 주문 금액 5,000 KRW. BTC 마켓 호가 0.00000001 BTC / 최소 0.00005 BTC, USDT 마켓 최소 0.5 USDT.
 """
@@ -63,7 +71,7 @@ from tradingbot.models import (
     interval_to_seconds,
     utcnow,
 )
-from tradingbot.utils.http import HttpClient
+from tradingbot.utils.http import RETRY_STATUS, HttpClient
 
 logger = logging.getLogger(__name__)
 
@@ -636,13 +644,32 @@ class UpbitBroker(BaseBroker):
             body["volume"] = _fmt_decimal(qty)
             body["price"] = _fmt_decimal(self.round_price(symbol, price))
 
+        # 클라이언트 주문 ID: 응답을 받지 못해도(타임아웃/연결 끊김) 거래소에 접수된 주문을 찾아 취소/확정할 수 있다.
+        identifier = str(uuid.uuid4())
+        body["identifier"] = identifier
         logger.info("Upbit 주문 접수: %s", body)
-        raw = self._private("POST", "/v1/orders", body=body, group="order", order_context=True)
+        recovered = False
+        try:
+            raw = self._private("POST", "/v1/orders", body=body, group="order", order_context=True)
+        except BrokerError as e:
+            if e.status_code is not None:
+                raise
+            raw = self._recover_lost_order(identifier, symbol, e)
+            recovered = True
         if not isinstance(raw, dict) or not raw.get("uuid"):
             raise OrderError(f"Upbit 주문 응답에 uuid 가 없습니다: {raw!r}", payload=raw)
         order_id = str(raw["uuid"])
         self._remember_qty(order_id, qty)
         order = self._parse_order(raw, requested_quantity=qty)
+        if recovered:
+            # identifier 조회 응답은 개별 주문 조회와 같은 형식(trades 포함)이라 추가 조회가 필요 없다
+            logger.warning(
+                "Upbit 주문 응답 유실 후 identifier 로 복구 uuid=%s state=%s (%s)",
+                order_id,
+                raw.get("state"),
+                symbol,
+            )
+            return order
         logger.info("Upbit 주문 접수 완료 uuid=%s state=%s", order_id, raw.get("state"))
         # 체결 수량 / 평균 체결가 / 수수료 보강 (trades 는 개별 주문 조회에서만 제공)
         try:
@@ -651,23 +678,42 @@ class UpbitBroker(BaseBroker):
             logger.warning("주문 %s 접수 후 상태 조회 실패 (접수 자체는 완료): %s", order_id, e)
         return order
 
-    def cancel_order(self, order_id: str, symbol: str | None = None) -> bool:
-        """취소 접수. 존재하지 않는 주문이면 False."""
+    def cancel_order(
+        self, order_id: str | None = None, symbol: str | None = None, *, identifier: str | None = None
+    ) -> bool:
+        """취소 접수 (``uuid`` 또는 클라이언트 ``identifier``). 존재하지 않는 주문이면 False."""
+        params = self._order_key(order_id, identifier)
         try:
-            raw = self._private("DELETE", "/v1/order", params={"uuid": order_id}, order_context=True)
+            raw = self._private("DELETE", "/v1/order", params=params, order_context=True)
         except OrderError as e:
             name, _ = _error_fields(e.payload)
             if e.status_code == 404 or name == "order_not_found":
-                logger.info("취소할 주문을 찾지 못함 uuid=%s", order_id)
+                logger.info("취소할 주문을 찾지 못함 %s", params)
                 return False
             raise
         return isinstance(raw, dict) and bool(raw.get("uuid"))
 
-    def get_order(self, order_id: str, symbol: str | None = None) -> Order:
-        raw = self._private("GET", "/v1/order", params={"uuid": order_id}, order_context=True)
+    def get_order(
+        self, order_id: str | None = None, symbol: str | None = None, *, identifier: str | None = None
+    ) -> Order:
+        """개별 주문 조회 (``uuid`` 또는 클라이언트 ``identifier``; 둘 다 주면 서버는 uuid 기준)."""
+        params = self._order_key(order_id, identifier)
+        raw = self._private("GET", "/v1/order", params=params, order_context=True)
         if not isinstance(raw, dict):
-            raise OrderError(f"Upbit 주문 조회 응답 형식 오류 uuid={order_id}", payload=raw)
+            raise OrderError(f"Upbit 주문 조회 응답 형식 오류 {params}", payload=raw)
         return self._parse_order(raw)
+
+    @staticmethod
+    def _order_key(order_id: str | None, identifier: str | None) -> dict[str, str]:
+        """``/v1/order`` 조회·취소 파라미터: uuid 와 identifier 중 적어도 하나 (공식 문서)."""
+        params: dict[str, str] = {}
+        if order_id:
+            params["uuid"] = str(order_id)
+        if identifier:
+            params["identifier"] = str(identifier)
+        if not params:
+            raise OrderError("Upbit 주문 조회/취소에는 uuid 또는 identifier 가 필요합니다")
+        return params
 
     def get_open_orders(self, symbol: str | None = None) -> list[Order]:
         """체결 대기(wait) + 예약(watch) 주문. 100개씩 페이지네이션."""
@@ -719,6 +765,38 @@ class UpbitBroker(BaseBroker):
         while len(self._requested_qty) > 1000:
             self._requested_qty.pop(next(iter(self._requested_qty)))
 
+    def _recover_lost_order(self, identifier: str, symbol: str, cause: BrokerError) -> dict[str, Any]:
+        """``POST /v1/orders`` 의 응답을 받지 못했을 때 ``identifier`` 로 접수 여부를 1회 확인한다.
+
+        거래소가 주문을 받았으면 그 주문(개별 조회 형식, trades 포함)을 돌려준다. ``order_not_found`` 면 접수되지
+        않은 것이므로 원래 네트워크 오류를 다시 던진다 (확인 자체가 실패하면 status 없는 BrokerError 로 감싼다 —
+        엔진은 이를 "결과 미확인" 으로 보고 거래소 기준으로 다시 확정한다).
+        """
+        logger.warning(
+            "Upbit 주문 응답 유실 (%s), identifier=%s 로 접수 여부 확인: %s", symbol, identifier, cause
+        )
+        try:
+            raw = self._private("GET", "/v1/order", params={"identifier": identifier}, order_context=True)
+        except BrokerError as e:
+            lookup_error: BrokerError = e
+        else:
+            if isinstance(raw, dict) and raw.get("uuid"):
+                return raw
+            raise BrokerError(
+                f"Upbit 주문 응답 유실 후 identifier={identifier} 조회 응답 형식 오류: {raw!r} (원인: {cause})",
+                payload=raw,
+            ) from cause
+        name, _ = _error_fields(lookup_error.payload)
+        if isinstance(lookup_error, OrderError) and (
+            lookup_error.status_code == 404 or name == "order_not_found"
+        ):
+            logger.warning("identifier=%s 주문이 거래소에 없음 → 접수되지 않은 것으로 처리", identifier)
+            raise cause
+        raise BrokerError(
+            f"Upbit 주문 응답 유실 후 identifier={identifier} 접수 여부 확인 실패: {lookup_error} (원인: {cause})",
+            payload=lookup_error.payload,
+        ) from cause
+
     def _parse_order(self, raw: dict[str, Any], requested_quantity: float | None = None) -> Order:
         order_id = str(raw.get("uuid") or "")
         side = OrderSide.BUY if raw.get("side") == "bid" else OrderSide.SELL
@@ -751,7 +829,7 @@ class UpbitBroker(BaseBroker):
             quantity = executed
 
         price = float(raw["price"]) if ord_type == "limit" and raw.get("price") not in (None, "") else None
-        status = self._map_state(raw.get("state"), volume, executed)
+        status = self._map_state(raw.get("state"), ord_type, volume, executed)
         return Order(
             id=order_id,
             symbol=str(raw.get("market") or ""),
@@ -769,10 +847,18 @@ class UpbitBroker(BaseBroker):
         )
 
     @staticmethod
-    def _map_state(state: Any, volume: float | None, executed: float) -> OrderStatus:
-        """wait/watch → OPEN(일부 체결이면 PARTIALLY_FILLED), done → FILLED(volume 미달이면 PARTIALLY_FILLED), cancel → CANCELED."""
+    def _map_state(state: Any, ord_type: str, volume: float | None, executed: float) -> OrderStatus:
+        """wait/watch → OPEN(일부 체결이면 PARTIALLY_FILLED), done → FILLED(volume 미달이면 PARTIALLY_FILLED), cancel → CANCELED.
+
+        단, 시장가 주문(``price``/``market``)의 ``cancel`` 은 체결 후 남은 잔량이 취소되며 **종료된** 상태다
+        (공식 문서: 시장가 매수는 체결 후 잔량이 생기면 ``cancel``, 딱 맞아떨어지면 ``done``). 체결 수량이 있으면
+        ``done`` 과 같이 판정한다 — 금액 주문(volume 없음)은 FILLED, 수량 주문은 volume 미달이면 PARTIALLY_FILLED.
+        지정가의 ``cancel`` 은 체결분이 있어도 CANCELED (사용자/엔진이 취소한 주문).
+        """
         if state in ("wait", "watch"):
             return OrderStatus.OPEN if executed <= 0 else OrderStatus.PARTIALLY_FILLED
+        if state == "cancel" and ord_type in ("price", "market") and executed > 0:
+            state = "done"
         if state == "done":
             if volume is not None and volume > 0 and executed + 1e-12 < volume:
                 return OrderStatus.PARTIALLY_FILLED
@@ -867,18 +953,54 @@ class UpbitBroker(BaseBroker):
         group: str = "default",
         order_context: bool = False,
     ) -> Any:
-        """인증 요청. GET/DELETE 는 해시한 쿼리 문자열을 그대로 URL 에 붙여 보내고, POST 는 JSON 본문."""
+        """인증 요청. GET/DELETE 는 해시한 쿼리 문자열을 그대로 URL 에 붙여 보내고, POST 는 JSON 본문.
+
+        재시도 규칙은 ``HttpClient`` 와 같다 (GET 만 429/5xx/네트워크 오류를 지수 백오프로 재시도, POST/DELETE 는 1회).
+        다만 nonce 는 요청마다 새 값이어야 하므로(재사용 시 401 ``nonce_used``) **시도마다 JWT 를 새로 만든다** —
+        ``HttpClient.request`` 는 같은 헤더로 재시도하기 때문에 세션을 직접 쓴다 (KIS 어댑터와 같은 방식).
+        """
         self._require_credentials()
-        token = self._jwt(params if params is not None else body)
-        headers = {"Authorization": f"Bearer {token}"}
-        url = f"{path}?{urlencode(params, doseq=True)}" if params else path
-        self._throttle(group)
+        method = method.upper()
+        hash_params = params if params is not None else body
+        client = self._client
+        url = f"{client.base_url}{path}"
+        if params:
+            url = f"{url}?{urlencode(params, doseq=True)}"
+        attempts = client.max_retries + 1 if method in ("GET", "HEAD") else 1
         try:
-            if body is not None:
-                return self._client.request(method, url, json=body, headers=headers)
-            return self._client.request(method, url, headers=headers)
+            for attempt in range(attempts):
+                self._throttle(group)
+                headers = {"Authorization": f"Bearer {self._jwt(hash_params)}"}
+                try:
+                    resp = client.session.request(
+                        method, url, json=body, headers=headers, timeout=client.timeout
+                    )
+                except requests.RequestException as e:
+                    if attempt < attempts - 1:
+                        logger.warning(
+                            "%s %s 네트워크 오류, 재시도 %d/%d: %s",
+                            method,
+                            path,
+                            attempt + 1,
+                            attempts - 1,
+                            e,
+                        )
+                        client._sleep(attempt)
+                        continue
+                    raise BrokerError(f"{method} {url} 네트워크 오류: {e}") from e
+                if resp.status_code in RETRY_STATUS and attempt < attempts - 1:
+                    logger.warning(
+                        "%s %s -> %s, 재시도 %d/%d", method, path, resp.status_code, attempt + 1, attempts - 1
+                    )
+                    client._sleep(attempt, retry_after=resp.headers.get("Retry-After"))
+                    continue
+                return client._handle(resp, method, url)
         except BrokerError as e:
-            raise self._translate(e, order_context=order_context) from e
+            translated = self._translate(e, order_context=order_context)
+            if translated is e:
+                raise
+            raise translated from e
+        raise BrokerError(f"{method} {url} 실패: 재시도 횟수 설정 오류 (max_retries={client.max_retries})")
 
     def _accounts(self) -> list[dict[str, Any]]:
         raw = self._private("GET", "/v1/accounts")
@@ -888,7 +1010,11 @@ class UpbitBroker(BaseBroker):
 
     @staticmethod
     def _translate(exc: BrokerError, *, order_context: bool) -> BrokerError:
-        """HttpClient 가 던진 BrokerError 를 업비트 오류 name 기준으로 세분화한다."""
+        """HttpClient 가 던진 BrokerError 를 업비트 오류 name 기준으로 세분화한다.
+
+        공식 가이드대로 HTTP 상태만으로 분기하지 않고 ``error.name`` 을 먼저 본다: 예를 들어 주문 API 의
+        403 ``market_offline``(시스템 점검) 은 인증 오류가 아니라 주문 오류다. 이름을 모르면 상태 코드로 분류한다.
+        """
         status = exc.status_code
         if status is None:  # 네트워크 오류 등: 그대로
             return exc
@@ -896,13 +1022,17 @@ class UpbitBroker(BaseBroker):
         detail = f"[{name}] {message}".strip() if name else str(exc.payload)[:300]
         msg = f"Upbit API 오류 (HTTP {status}): {detail}"
         kwargs: dict[str, Any] = {"status_code": status, "payload": exc.payload}
-        if (name in _AUTH_ERROR_NAMES) or status in (401, 403):
-            return AuthenticationError(msg, **kwargs)
         if name and name.startswith(_INSUFFICIENT_FUNDS_PREFIX):
             return InsufficientFunds(msg, **kwargs)
-        if (name in _RATE_LIMIT_ERROR_NAMES) or status in (429, 418):
+        if name in _RATE_LIMIT_ERROR_NAMES:
             return RateLimitError(msg, **kwargs)
-        if (name in _ORDER_ERROR_NAMES) or (order_context and 400 <= status < 500):
+        if name in _ORDER_ERROR_NAMES:
+            return OrderError(msg, **kwargs)
+        if (name in _AUTH_ERROR_NAMES) or status in (401, 403):
+            return AuthenticationError(msg, **kwargs)
+        if status in (429, 418):
+            return RateLimitError(msg, **kwargs)
+        if order_context and 400 <= status < 500:
             return OrderError(msg, **kwargs)
         return BrokerError(msg, **kwargs)
 

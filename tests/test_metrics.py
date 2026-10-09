@@ -337,6 +337,65 @@ class TestTradeStats:
         assert compute_metrics(pd.Series([100.0, 101.0]), [make_trade(100, 101)], 365)["exposure"] == 0.0
 
 
+# ============================================================================ 초기 자산 기준점 (initial_equity)
+class TestInitialEquity:
+    def test_anchors_total_return_drawdown_and_returns(self):
+        m = compute_metrics(daily_series([99, 110, 99, 120]), [], 365, initial_equity=100)
+        assert m["total_return"] == approx(0.2)  # 120/100 - 1 (첫 bar 종가 99 기준이 아님)
+        assert m["max_drawdown"] == approx(0.1)  # max(1 - 99/100, 1 - 99/110)
+        assert m["max_drawdown_duration_bars"] == 1
+        rets = np.array([99 / 100 - 1, 110 / 99 - 1, 99 / 110 - 1, 120 / 99 - 1])  # bar 0 수익률 포함
+        assert m["volatility"] == approx(rets.std(ddof=1) * math.sqrt(365))
+        assert m["sharpe"] == approx(rets.mean() / rets.std(ddof=1) * math.sqrt(365))
+        downside = math.sqrt((np.minimum(rets, 0) ** 2).sum() / 3)
+        assert m["sortino"] == approx(rets.mean() / downside * math.sqrt(365))
+        years = 3 / 365.25  # 경과 시간은 첫/마지막 timestamp 그대로
+        assert m["cagr"] == approx(1.2 ** (1 / years) - 1)
+        assert m["calmar"] == approx(m["cagr"] / 0.1)
+
+    def test_without_initial_equity_first_bar_is_the_anchor(self):
+        m = compute_metrics(daily_series([99, 110, 99, 120]), [], 365)
+        assert m["total_return"] == approx(120 / 99 - 1)
+        assert m["max_drawdown"] == approx(0.1)
+        rets = np.array([110 / 99 - 1, 99 / 110 - 1, 120 / 99 - 1])
+        assert m["volatility"] == approx(rets.std(ddof=1) * math.sqrt(365))
+
+    def test_initial_equal_to_first_value_adds_a_zero_bar0_return(self):
+        base = compute_metrics(daily_series([100, 110, 99, 120]), [], 365)
+        m = compute_metrics(daily_series([100, 110, 99, 120]), [], 365, initial_equity=100)
+        assert m["total_return"] == base["total_return"] == approx(0.2)
+        assert m["max_drawdown"] == base["max_drawdown"] == approx(0.1)
+        assert m["cagr"] == approx(base["cagr"])
+        rets = np.array([0.0, 0.1, 99 / 110 - 1, 120 / 99 - 1])
+        assert m["volatility"] == approx(rets.std(ddof=1) * math.sqrt(365))
+        assert m["volatility"] != approx(base["volatility"])
+
+    def test_single_point_is_judged_against_initial(self):
+        m = compute_metrics(daily_series([90]), [], 365, initial_equity=100)
+        assert m["total_return"] == approx(-0.1)
+        assert m["max_drawdown"] == approx(0.1)
+        assert m["max_drawdown_duration_bars"] == 1
+        assert m["sharpe"] == 0.0 and m["volatility"] == 0.0  # 수익률 1개 → 표준편차 없음
+
+    def test_drawdown_series_with_initial_equity(self):
+        assert list(drawdown_series(daily_series([99, 110, 99]), initial_equity=100)) == approx(
+            [0.01, 0.0, 0.1]
+        )
+        assert list(drawdown_series(daily_series([99, 110, 99]))) == approx([0.0, 0.0, 0.1])
+        assert list(drawdown_series(daily_series([120, 110]), initial_equity=100)) == approx(
+            [0.0, 1 - 110 / 120]
+        )
+
+    def test_numpy_initial_equity_accepted(self):
+        m = compute_metrics(daily_series([100, 110]), [], 365, initial_equity=np.float64(100))
+        assert m["total_return"] == approx(0.1)
+
+    @pytest.mark.parametrize("bad", [0, -1.0, float("nan"), float("inf"), True, "100"])
+    def test_invalid_initial_equity_raises(self, bad):
+        with pytest.raises(ValueError):
+            compute_metrics(daily_series([100, 110]), [], 365, initial_equity=bad)
+
+
 # ============================================================================ 실제 데이터
 class TestRealData:
     def test_buy_and_hold_curve_from_real_candles(self, daily_df):
@@ -409,6 +468,47 @@ class TestRealData:
             assert m["avg_win"] == approx(sum(wins) / len(wins))
         held = sum(b - a for a, b in pairs)
         assert m["exposure"] == approx(held / len(close))
+
+    def test_buy_and_hold_from_bar0_with_costs_anchored_at_initial_cash(self, daily_df):
+        """bar 0 종가에 전액 매수(진입 비용 0.1%) 한 buy&hold: 초기 현금 기준 지표는 그 비용을 포함한다."""
+        close = daily_df["close"].to_numpy()
+        cash = 10_000_000.0
+        cost = 0.001  # 수수료 + 슬리피지
+        equity = pd.Series(
+            cash * (1 - cost) * close / close[0], index=pd.DatetimeIndex(daily_df["timestamp"])
+        )
+        m = compute_metrics(equity, [], 365, initial_equity=cash)
+        naive = compute_metrics(equity, [], 365)
+
+        assert m["total_return"] == approx((1 - cost) * close[-1] / close[0] - 1)
+        assert naive["total_return"] == approx(
+            close[-1] / close[0] - 1
+        )  # 첫 bar 종가 기준이면 비용이 사라진다
+        assert m["total_return"] < naive["total_return"]
+
+        # 낙폭/지속 bar 를 초기 현금을 첫 고점으로 두고 독립 계산
+        peak = cash
+        mdd = 0.0
+        run = longest = 0
+        for v in equity.to_numpy():
+            peak = max(peak, v)
+            dd = 1 - v / peak
+            mdd = max(mdd, dd)
+            run = run + 1 if dd > 0 else 0
+            longest = max(longest, run)
+        assert m["max_drawdown"] == approx(mdd)
+        assert mdd >= cost - 1e-12  # bar 0 에 이미 cost 만큼 하락
+        assert m["max_drawdown_duration_bars"] == longest >= 1
+
+        # bar 수익률은 초기 현금 대비 bar 0 수익률(-cost) 부터 시작해 bar 수만큼이다
+        values = np.concatenate(([cash], equity.to_numpy()))
+        rets = np.diff(values) / values[:-1]
+        assert len(rets) == len(close)
+        assert rets[0] == approx(-cost)
+        assert m["sharpe"] == approx(rets.mean() / rets.std(ddof=1) * math.sqrt(365))
+        assert m["volatility"] == approx(rets.std(ddof=1) * math.sqrt(365))
+        days = (equity.index[-1] - equity.index[0]).total_seconds() / 86400
+        assert m["cagr"] == approx((1 + m["total_return"]) ** (365.25 / days) - 1, rel=1e-9)
 
 
 # ============================================================================ format_metrics

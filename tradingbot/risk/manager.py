@@ -5,7 +5,8 @@
 - 포지션 크기 산정 (총자산/운용한도 × 비중 × 신호 강도, 현금·최소 주문 금액 제한)
 - 진입 시 손절/익절 가격과 메타 정보 기록
 - 매 폴링마다 손절 → 추적손절 → 익절 순으로 청산 판정
-- 당일 실현 손익 누적 (UTC 날짜 기준, 날짜가 바뀌면 리셋)
+- 당일 실현 손익 누적 (UTC 날짜 기준, 날짜가 **앞으로** 바뀌면 리셋. 추적 중인 날짜보다 이전 시각은
+  거래소/엔진 시계 차이로 보고 당일에 집계한다 — 뒤로 되감아 당일 시작 자산을 지우지 않는다)
 
 이 모듈은 네트워크/브로커에 의존하지 않는 순수 로직이다. 모든 datetime 은 UTC aware 로 다룬다.
 """
@@ -116,6 +117,7 @@ class RiskManager:
         self._day_start_equity: float | None = None  # 당일 시작 자산 (모르면 None)
         self._daily_trades: int = 0
         self._warned_unknown_equity = False
+        self._warned_backwards: date | None = None
 
     # ------------------------------------------------------------------ 일자 추적
     @staticmethod
@@ -125,9 +127,23 @@ class RiskManager:
         return ensure_utc(now).date()
 
     def _roll_day(self, now: datetime) -> bool:
-        """now 의 UTC 날짜가 추적 중인 날짜와 다르면 당일 집계를 리셋한다. 리셋했으면 True."""
+        """now 의 UTC 날짜가 추적 중인 날짜보다 **뒤** 면 당일 집계를 리셋한다. 리셋했으면 True.
+
+        추적 중인 날짜보다 이전이면(자정 직후 폴링에서 거래소 체결 시각이 전날 23:59:5x 인 경우 등) 되감지 않는다 —
+        되감으면 당일 손익과 시작 자산이 사라져 일일 손실 한도가 그날 내내 꺼진다.
+        """
         today = self._utc_date(now)
         if self._day == today:
+            return False
+        if self._day is not None and today < self._day:
+            if self._warned_backwards != today:
+                self._warned_backwards = today
+                logger.warning(
+                    "UTC 날짜 %s 는 추적 중인 %s 보다 이전입니다 (거래소/엔진 시계 차이?) → 당일(%s) 집계 유지",
+                    today.isoformat(),
+                    self._day.isoformat(),
+                    self._day.isoformat(),
+                )
             return False
         if self._day is not None:
             logger.info(
@@ -161,9 +177,13 @@ class RiskManager:
         self._day_start_equity = float(equity)
         logger.info("당일(%s) 시작 자산 기록: %s", self._day, _fmt(self._day_start_equity))
 
-    def record_trade(self, trade: Trade) -> None:
-        """청산 완료 Trade 의 손익을 당일 실현 손익에 누적한다 (날짜 기준: trade.exit_time)."""
-        self._roll_day(trade.exit_time)
+    def record_trade(self, trade: Trade, *, now: datetime | None = None) -> None:
+        """청산 완료 Trade 의 손익을 당일 실현 손익에 누적한다.
+
+        날짜 기준은 ``now`` (엔진 시계) 가 주어지면 그 값, 아니면 ``trade.exit_time`` (거래소 체결 시각).
+        엔진은 ``now`` 를 넘겨 거래소 시계 차이가 당일 집계를 흔들지 않게 한다.
+        """
+        self._roll_day(now if now is not None else trade.exit_time)
         pnl = float(trade.pnl)
         if not math.isfinite(pnl):
             logger.warning("%s 거래 손익이 유효하지 않아 누적하지 않습니다: %r", trade.symbol, pnl)

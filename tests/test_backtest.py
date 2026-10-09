@@ -7,10 +7,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from datetime import datetime, timezone
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import pytest
 from pytest import approx
@@ -197,11 +199,27 @@ def check_invariants(result: BacktestResult, data: dict[str, pd.DataFrame], risk
         assert t.entry_time in sym_ts and t.exit_time in sym_ts
         assert t.fee > 0
         assert t.quantity > 0 and t.entry_price > 0 and t.exit_price > 0
-    # 지표는 compute_metrics 와 일치
+    # 지정가 체결가는 그 bar 의 [low, high] 안 (갭 통과면 시가) — 거래된 적 없는 가격은 없다
+    for o in filled(result):
+        if o.type == OrderType.LIMIT:
+            df = data[o.symbol]
+            j = index_of(df, o.created_at)
+            assert float(df["low"].iat[j]) <= o.average_price <= float(df["high"].iat[j])
+            assert o.raw.get("fill_basis") in ("open", "limit")
+
+    # 지표는 compute_metrics(초기 현금 기준점) 와 일치하고, 총수익률은 BacktestResult.total_return 과 같다
     ppy = periods_per_year(result.interval, result.asset_class)
-    ref = compute_metrics(result.equity_curve, result.trades, ppy, exposure=result.metrics["exposure"])
+    ref = compute_metrics(
+        result.equity_curve,
+        result.trades,
+        ppy,
+        exposure=result.metrics["exposure"],
+        initial_equity=result.initial_cash,
+    )
     for k in METRIC_KEYS:
         assert result.metrics[k] == approx(ref[k]), k
+    assert result.metrics["total_return"] == approx(result.total_return)
+    assert result.metrics["total_return"] == approx(result.final_equity / INITIAL - 1)
 
 
 def signal_actions(strategy: BaseStrategy, df: pd.DataFrame, symbol: str = BTC) -> list[Signal]:
@@ -231,7 +249,9 @@ def test_every_strategy_on_real_hourly(candles_df, name):
     res = run_bt(name, {BTC: candles_df}, risk=risk, interval="1h")
     check_invariants(res, {BTC: candles_df}, risk)
     assert res.interval == "1h"
-    ref = compute_metrics(res.equity_curve, res.trades, 8760.0, exposure=res.metrics["exposure"])
+    ref = compute_metrics(
+        res.equity_curve, res.trades, 8760.0, exposure=res.metrics["exposure"], initial_equity=INITIAL
+    )
     assert res.metrics["sharpe"] == approx(ref["sharpe"])
 
 
@@ -722,7 +742,9 @@ def test_limit_buy_fills_at_price_or_is_canceled(daily_df):
         assert o.price == approx(c[j - 1] * 0.997)
         if lo[j] <= o.price:
             assert o.status == OrderStatus.FILLED
-            assert o.average_price == approx(o.price)  # 지정가는 슬리피지 없음
+            # 시가가 이미 지정가 아래면(갭 통과) 시가, 아니면 지정가 — 슬리피지 없음, 체결가는 bar 범위 안
+            assert o.average_price == approx(min(o.price, o_[j]))
+            assert o.raw["fill_basis"] == ("open" if o_[j] <= o.price else "limit")
             n_filled += 1
         else:
             assert o.status == OrderStatus.CANCELED
@@ -766,14 +788,16 @@ def test_limit_sell_fills_when_high_reaches_price(daily_df):
     risk = make_risk()
     res = run_bt("alt", {BTC: daily_df}, strategy=AlternatingLimitSellStrategy(), risk=risk)
     check_invariants(res, {BTC: daily_df}, risk)
-    h, c = daily_df["high"].to_numpy(), daily_df["close"].to_numpy()
+    h, c, o_ = (daily_df[col].to_numpy() for col in ("high", "close", "open"))
     sells = [o for o in res.orders if o.side == OrderSide.SELL]
     assert sells and all(o.type == OrderType.LIMIT for o in sells)
     for o in sells:
         j = index_of(daily_df, o.created_at)
         assert o.price == approx(c[j - 1] * 1.002)
         if h[j] >= o.price:
-            assert o.status == OrderStatus.FILLED and o.average_price == approx(o.price)
+            # 시가가 이미 지정가 위면(갭 통과) 시가, 아니면 지정가
+            assert o.status == OrderStatus.FILLED and o.average_price == approx(max(o.price, o_[j]))
+            assert o.raw["fill_basis"] == ("open" if o_[j] >= o.price else "limit")
         else:
             assert o.status == OrderStatus.CANCELED
     assert {o.status for o in sells} == {OrderStatus.FILLED, OrderStatus.CANCELED}
@@ -899,6 +923,211 @@ def test_open_position_at_end_is_marked_to_close(daily_df):
     assert res2.orders == [] and res2.open_positions == []
 
 
+# ============================================================================ 회귀: LIMIT 체결의 bar 내 분류 / 갭 통과
+class LimitBelowCloseStrategy(BaseStrategy):
+    """매 bar 종가 1% 아래 지정가 매수, 최대 3봉 보유. 시가 아래 지정가 체결은 시가 이후(bar 중간) 체결이다."""
+
+    name = "limit_below"
+    default_params: dict[str, Any] = {"pct": 0.01, "hold": 3}
+
+    @property
+    def warmup(self) -> int:
+        return 1
+
+    def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
+        return df.copy()
+
+    def signal_at(self, symbol: str, df: pd.DataFrame, i: int) -> Signal:
+        return Signal(
+            action=SignalAction.BUY,
+            symbol=symbol,
+            order_type=OrderType.LIMIT,
+            price=float(df["close"].iat[i]) * (1 - self.params["pct"]),
+            max_holding_bars=self.params["hold"],
+            reason="시가 아래 지정가",
+        )
+
+
+class LimitAboveCloseStrategy(LimitBelowCloseStrategy):
+    """매 bar 종가 2% 위 지정가 매수 (시가가 그 아래면 갭 통과로 시가 체결), 최대 3봉 보유."""
+
+    name = "limit_above"
+    default_params: dict[str, Any] = {"pct": 0.02, "hold": 3}
+
+    def signal_at(self, symbol: str, df: pd.DataFrame, i: int) -> Signal:
+        return Signal(
+            action=SignalAction.BUY,
+            symbol=symbol,
+            order_type=OrderType.LIMIT,
+            price=float(df["close"].iat[i]) * (1 + self.params["pct"]),
+            max_holding_bars=self.params["hold"],
+            reason="시가 위 지정가",
+        )
+
+
+def test_limit_fill_below_open_is_judged_at_close_not_at_that_open(daily_df):
+    """시가 아래 지정가 체결은 시가가 찍힌 **뒤** 의 체결이므로, 같은 bar 의 시가(이미 지나간 가격) 로 익절할 수 없다.
+
+    수정 전에는 이 체결이 '시가 체결' 로 분류되어 bar 내 리스크 판정의 첫 단계(시가 갭 판정) 가 돌았고, 시가가
+    익절가 이상인 bar 마다 시가×(1-슬리피지) 에 '익절' 하는 미래 참조가 생겼다 (승률 100%).
+    """
+    risk = make_risk(max_position_pct=1.0, max_positions=1, take_profit_pct=0.005)
+    res = run_bt("limit_below", {BTC: daily_df}, strategy=LimitBelowCloseStrategy(), risk=risk)
+    check_invariants(res, {BTC: daily_df}, risk)
+    o_, c = daily_df["open"].to_numpy(), daily_df["close"].to_numpy()
+    below_open = [t for t in res.trades if t.entry_price < o_[index_of(daily_df, t.entry_time)]]
+    assert below_open  # 실제 데이터에 시가 아래 체결이 있어야 의미 있는 검증이다
+    # 시가가 익절가 이상인 진입 bar (수정 전이라면 시가로 '익절' 했을 bar) 가 실제로 있어야 회귀 검증이 된다
+    assert any(o_[index_of(daily_df, t.entry_time)] >= t.entry_price * 1.005 for t in below_open)
+    for t in below_open:
+        j = index_of(daily_df, t.entry_time)
+        if t.exit_time == t.entry_time:
+            # 같은 bar 청산은 종가 판정뿐: 종가 체결이고, 종가가 익절가 이상이어야 한다
+            assert t.exit_price == approx(c[j] * (1 - SLIP))
+            assert c[j] >= t.entry_price * 1.005 * (1 - 1e-9)
+            assert "익절" in t.reason
+    # 지정가(시가 아래) 체결 bar 에서 종가 판정이 실제로 일어나는 경우와 아닌 경우가 섞여 있어야 한다
+    same_bar = [t for t in below_open if t.exit_time == t.entry_time]
+    assert 0 < len(same_bar) < len(below_open)
+
+
+def test_limit_fill_at_open_is_risk_checked_on_entry_bar(daily_df):
+    """시가 이하의 지정가는 시가에 체결되고(갭 통과), 그 bar 의 저가가 손절가에 닿으면 **그 bar 에** 손절된다.
+
+    수정 전에는 지정가가 시가보다 높다는 이유로 '시가보다 높은 가격에 체결' 되고 bar 중간 체결로 분류되어
+    진입 bar 의 저가를 손절가와 비교하지 않았다.
+    """
+    risk = make_risk(max_position_pct=1.0, max_positions=1, stop_loss_pct=0.01)
+    res = run_bt("limit_above", {BTC: daily_df}, strategy=LimitAboveCloseStrategy(), risk=risk)
+    check_invariants(res, {BTC: daily_df}, risk)
+    o_, lo, hi = (daily_df[col].to_numpy() for col in ("open", "low", "high"))
+    fills = [o for o in res.orders if o.type == OrderType.LIMIT and o.status == OrderStatus.FILLED]
+    at_open = [o for o in fills if o.raw["fill_basis"] == "open"]
+    assert at_open
+    for o in fills:
+        j = index_of(daily_df, o.created_at)
+        assert o.average_price == approx(min(o.price, o_[j]))
+        assert lo[j] <= o.average_price <= hi[j]  # 고가 위의 '체결가' 는 없다
+    touched = 0
+    for o in at_open:
+        j = index_of(daily_df, o.created_at)
+        stop = o.average_price * (1 - 0.01)
+        if lo[j] > stop:
+            continue
+        touched += 1
+        t = next((t for t in res.trades if t.entry_time == o.created_at), None)
+        assert t is not None, "진입 bar 저가가 손절가에 닿았는데 청산 거래가 없다"
+        assert t.exit_time == o.created_at and "손절" in t.reason
+        assert t.exit_price == approx(stop * (1 - SLIP))
+    assert touched > 0  # 실제 데이터에 '진입 bar 에 손절가 터치' 가 있어야 의미 있는 검증이다
+
+
+# ============================================================================ 회귀: numpy 정수 max_holding_bars
+class ColumnHoldStrategy(PeriodicHoldStrategy):
+    """보유 기간을 prepare() 가 만든 컬럼에서 ``.iat`` 로 읽는다 → numpy 정수(np.int64) 가 Signal 에 실린다."""
+
+    name = "periodic_hold_col"
+
+    def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        out["hold"] = self.params["hold"]  # 파이썬 int 로 채워도 .iat 는 np.int64 를 돌려준다
+        return out
+
+    def signal_at(self, symbol: str, df: pd.DataFrame, i: int) -> Signal:
+        if i % self.params["every"] == 0:
+            hold = df["hold"].iat[i]
+            assert isinstance(hold, np.integer) and not isinstance(hold, int)  # 검증 대상 전제
+            return Signal(action=SignalAction.BUY, symbol=symbol, max_holding_bars=hold, reason="주기")
+        return Signal.hold(symbol)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda: PeriodicHoldStrategy(hold=np.int64(3)),
+        lambda: PeriodicHoldStrategy(hold=np.int32(3)),
+        lambda: PeriodicHoldStrategy(hold=np.float64(3.0)),
+        lambda: PeriodicHoldStrategy(hold="3"),
+        lambda: ColumnHoldStrategy(hold=3),
+    ],
+    ids=["np.int64", "np.int32", "np.float64(3.0)", "str", "dataframe-column"],
+)
+def test_max_holding_bars_accepts_numpy_and_integral_values(daily_df, make):
+    """numpy 정수/정수값 실수/숫자 문자열 max_holding_bars 도 파이썬 int 와 똑같이 만료 청산된다 (엔진 int() 해석과 동일).
+
+    수정 전에는 ``isinstance(hold, int)`` 만 통과시켜 np.int64 는 조용히 None 이 되었고, 백테스트만 포지션을
+    영원히 들고 있었다 (모의/실거래 엔진은 같은 신호를 만료 청산한다).
+    """
+    risk = make_risk()
+    ref = run_bt("periodic", {BTC: daily_df}, strategy=PeriodicHoldStrategy(), risk=make_risk())
+    res = run_bt("periodic", {BTC: daily_df}, strategy=make(), risk=risk)
+    check_invariants(res, {BTC: daily_df}, risk)
+    assert len(ref.trades) >= 19
+    assert [(t.entry_time, t.exit_time, t.entry_price, t.exit_price, t.reason) for t in res.trades] == [
+        (t.entry_time, t.exit_time, t.entry_price, t.exit_price, t.reason) for t in ref.trades
+    ]
+    assert all(REASON_MAX_HOLDING in t.reason for t in res.trades)
+    assert len(res.open_positions) == len(ref.open_positions)
+    pd.testing.assert_series_equal(res.equity_curve, ref.equity_curve)
+
+
+def test_unparseable_max_holding_bars_warns_instead_of_silently_dropping(daily_df, caplog):
+    """해석할 수 없는 max_holding_bars(소수점 실수) 는 경고를 남기고 '제한 없음' 으로 처리된다."""
+    risk = make_risk()
+    with caplog.at_level(logging.WARNING, logger="tradingbot.backtest.engine"):
+        res = run_bt("periodic", {BTC: daily_df}, strategy=PeriodicHoldStrategy(hold=2.5), risk=risk)
+    check_invariants(res, {BTC: daily_df}, risk)
+    assert res.trades == [] and len(res.open_positions) == 1  # 만료 청산이 없어 첫 포지션을 끝까지 보유
+    assert any("max_holding_bars=2.5" in r.getMessage() for r in caplog.records)
+
+
+# ============================================================================ 회귀: 지표 기준점 = 초기 현금
+class BuyFirstBarStrategy(BaseStrategy):
+    """bar 0 에서 한 번 BUY (fill_on=close 면 bar 0 종가 체결 → 자산 곡선 첫 점부터 손익이 생긴다)."""
+
+    name = "buy_first"
+    default_params: dict[str, Any] = {}
+
+    @property
+    def warmup(self) -> int:
+        return 1
+
+    def prepare(self, df: pd.DataFrame) -> pd.DataFrame:
+        return df.copy()
+
+    def signal_at(self, symbol: str, df: pd.DataFrame, i: int) -> Signal:
+        if i == 0:
+            return Signal(action=SignalAction.BUY, symbol=symbol, reason="첫 bar")
+        return Signal.hold(symbol)
+
+
+def test_bar0_fill_costs_are_in_metrics_and_total_return_matches_result(daily_df):
+    """지표는 초기 현금을 기준점으로 잰다: bar 0 체결의 수수료/슬리피지가 지표에서 빠지지 않고
+    ``metrics["total_return"] == BacktestResult.total_return == final_equity / initial_cash - 1`` 이다.
+
+    수정 전에는 첫 bar **종가** 자산을 기준으로 삼아 bar 0 의 비용이 모든 곡선 지표에서 빠졌고,
+    summary() 의 '최종 자산 (x%)' 와 '총 수익률' 이 서로 달랐다.
+    """
+    risk = make_risk(max_position_pct=1.0)
+    res = run_bt("buy_first", {BTC: daily_df}, strategy=BuyFirstBarStrategy(), risk=risk, fill_on="close")
+    check_invariants(res, {BTC: daily_df}, risk)
+    e0 = float(res.equity_curve.iloc[0])
+    assert e0 < INITIAL  # bar 0 종가 체결: 수수료 + 슬리피지만큼 손실
+    assert res.metrics["total_return"] == approx(res.total_return)
+    assert res.metrics["total_return"] == approx(res.final_equity / INITIAL - 1)
+    # 첫 bar 종가 기준(수정 전) 으로 재면 bar 0 비용만큼 총수익률이 부푼다
+    naive = compute_metrics(res.equity_curve, res.trades, 365.0, exposure=res.metrics["exposure"])
+    assert naive["total_return"] == approx(res.final_equity / e0 - 1)
+    assert naive["total_return"] > res.metrics["total_return"]
+    # 낙폭도 초기 현금 기준: 첫 bar 부터 (1 - e0/INITIAL) 이상의 낙폭이 잡힌다
+    assert res.metrics["max_drawdown"] >= (1 - e0 / INITIAL) - 1e-12
+    assert res.metrics["max_drawdown_duration_bars"] >= 1
+    # 요약의 두 수익률 표기가 같다
+    summary = res.summary()
+    assert f"({res.total_return * 100:+.2f}%)" in summary
+    assert "총 수익률" in summary and f" : {res.total_return * 100:+.2f}%" in summary
+
+
 class InvalidLimitStrategy(BaseStrategy):
     name = "bad_limit"
     default_params: dict[str, Any] = {}
@@ -955,7 +1184,9 @@ def test_round_quantity_callable_is_applied(daily_df):
 
 def test_stock_asset_class_uses_252_periods(daily_df):
     res = run_bt("sma_cross", {BTC: daily_df}, asset_class=AssetClass.STOCK)
-    ref = compute_metrics(res.equity_curve, res.trades, 252.0, exposure=res.metrics["exposure"])
+    ref = compute_metrics(
+        res.equity_curve, res.trades, 252.0, exposure=res.metrics["exposure"], initial_equity=INITIAL
+    )
     assert res.metrics["sharpe"] == approx(ref["sharpe"])
     assert res.asset_class == AssetClass.STOCK
     assert res.to_dict()["asset_class"] == "stock"

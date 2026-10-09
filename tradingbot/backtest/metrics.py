@@ -13,12 +13,18 @@
 - ``cagr`` 는 첫/마지막 timestamp 사이의 경과 시간을 연 단위로 환산해 계산한다
   (index 가 datetime 이 아니면 ``bar 수 / periods_per_year`` 로 대체).
 - ``profit_factor`` 는 손실 거래가 없고 이익 거래가 있으면 ``inf`` 다 (JSON 저장 시 호출자가 처리).
+- ``initial_equity`` (백테스터는 초기 현금을 넘긴다) 를 주면 총수익률·낙폭·bar 수익률의 기준점이 첫 bar
+  종가가 아니라 그 값이 된다: ``total_return = last / initial_equity - 1``, 누적 최고 자산은
+  ``initial_equity`` 에서 시작하고 bar 0 의 수익률(``equity[0] / initial_equity - 1``) 이 수익률 열에
+  들어간다. 그래야 bar 0 체결의 수수료/슬리피지/가격 변동이 지표에서 빠지지 않고
+  ``BacktestResult.total_return`` 과 일치한다. 주지 않으면 첫 bar 종가(``equity[0]``) 기준이다.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import numbers
 import unicodedata
 from collections.abc import Sequence
 from typing import Any
@@ -112,19 +118,30 @@ def _as_equity_series(equity: pd.Series | Sequence[float] | np.ndarray) -> pd.Se
     return values
 
 
-def _bar_returns(equity: pd.Series) -> pd.Series:
-    """bar 단위 단순 수익률. 직전 자산이 0 이면 그 구간은 제외한다."""
-    prev = equity.shift(1)
+def _bar_returns(equity: pd.Series, initial_equity: float | None = None) -> pd.Series:
+    """bar 단위 단순 수익률. ``initial_equity`` 가 있으면 bar 0 의 수익률(초기 자산 대비) 도 포함한다.
+
+    직전 자산이 0 이면 그 구간은 제외한다.
+    """
+    cur = equity.to_numpy(dtype=float)
+    if initial_equity is None:
+        prev, cur = cur[:-1], cur[1:]
+    else:
+        prev = np.concatenate(([float(initial_equity)], cur[:-1]))
     with np.errstate(divide="ignore", invalid="ignore"):
-        rets = (equity - prev) / prev
-    rets = rets.replace([np.inf, -np.inf], np.nan).dropna()
-    return rets
+        rets = pd.Series((cur - prev) / prev, dtype=float)
+    return rets.replace([np.inf, -np.inf], np.nan).dropna()
 
 
-def drawdown_series(equity: pd.Series) -> pd.Series:
-    """누적 최고 자산 대비 하락폭 (0 이상의 소수, 같은 인덱스)."""
+def drawdown_series(equity: pd.Series, initial_equity: float | None = None) -> pd.Series:
+    """누적 최고 자산 대비 하락폭 (0 이상의 소수, 같은 인덱스).
+
+    ``initial_equity`` 를 주면 그것을 첫 bar 이전의 최고 자산으로 삼아 bar 0 부터 낙폭을 잰다.
+    """
     values = _as_equity_series(equity)
     running_max = values.cummax()
+    if initial_equity is not None:
+        running_max = running_max.clip(lower=float(initial_equity))
     with np.errstate(divide="ignore", invalid="ignore"):
         dd = 1.0 - values / running_max
     return dd.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
@@ -236,6 +253,7 @@ def compute_metrics(
     periods_per_year: float,
     *,
     exposure: float | None = None,
+    initial_equity: float | None = None,
 ) -> dict[str, float]:
     """자산 곡선과 거래 목록으로 성과 지표 dict 를 만든다 (키는 ``METRIC_KEYS``).
 
@@ -244,20 +262,29 @@ def compute_metrics(
         trades: 청산 완료 Trade 목록.
         periods_per_year: 연 환산 bar 수 (``periods_per_year()``).
         exposure: 포지션 보유 bar 비율. 백테스터가 직접 계산해 넘긴다. None 이면 Trade 구간으로 근사.
+        initial_equity: 첫 bar 이전의 자산(백테스터의 초기 현금). 주면 총수익률/낙폭/bar 수익률의
+            기준점이 되어 bar 0 의 손익도 지표에 들어간다. None 이면 첫 bar 종가 기준.
     """
     if not isinstance(periods_per_year, (int, float)) or isinstance(periods_per_year, bool):
         raise ValueError(f"periods_per_year 는 숫자여야 합니다: {periods_per_year!r}")
     ppy = float(periods_per_year)
     if not math.isfinite(ppy) or ppy <= 0:
         raise ValueError(f"periods_per_year 는 0 보다 큰 유한한 값이어야 합니다: {periods_per_year!r}")
+    initial: float | None = None
+    if initial_equity is not None:
+        if not isinstance(initial_equity, numbers.Real) or isinstance(initial_equity, bool):
+            raise ValueError(f"initial_equity 는 숫자여야 합니다: {initial_equity!r}")
+        initial = float(initial_equity)
+        if not math.isfinite(initial) or initial <= 0:
+            raise ValueError(f"initial_equity 는 0 보다 큰 유한한 값이어야 합니다: {initial_equity!r}")
 
     values = _as_equity_series(equity)
     n_bars = len(values)
-    first = float(values.iloc[0])
+    first = initial if initial is not None else float(values.iloc[0])
     last = float(values.iloc[-1])
     total_return = (last / first - 1.0) if first != 0 else 0.0
 
-    rets = _bar_returns(values)
+    rets = _bar_returns(values, initial)
     n_rets = len(rets)
     sqrt_ppy = math.sqrt(ppy)
     if n_rets >= 2:
@@ -271,7 +298,7 @@ def compute_metrics(
     sharpe = mean / std * sqrt_ppy if std > 0 else 0.0
     sortino = mean / downside_dev * sqrt_ppy if downside_dev > 0 else 0.0
 
-    dd = drawdown_series(values)
+    dd = drawdown_series(values, initial)
     max_dd = float(dd.max()) if n_bars else 0.0
     max_dd_bars = _max_drawdown_duration(dd)
 

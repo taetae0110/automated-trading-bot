@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import stat
 import time
@@ -28,6 +29,7 @@ from freezegun import freeze_time
 from tradingbot.brokers import create_broker, get_broker_class
 from tradingbot.brokers.kis import (
     PAPER_BASE_URL,
+    PAPER_REQUEST_INTERVAL,
     PATH_BALANCE,
     PATH_DAILY_CCLD,
     PATH_DAILY_CHART,
@@ -36,10 +38,13 @@ from tradingbot.brokers.kis import (
     PATH_ORDER_RVSECNCL,
     PATH_PAST_MINUTE_CHART,
     PATH_PRICE,
+    PATH_PSBL_ORDER,
     PATH_TODAY_MINUTE_CHART,
     PATH_TOKEN,
     REAL_BASE_URL,
+    REAL_REQUEST_INTERVAL,
     KISBroker,
+    KISBuyingPower,
     krx_tick_size,
     round_to_tick,
 )
@@ -519,6 +524,45 @@ def price_output(price: float) -> dict:
             "stck_shrn_iscd": SYMBOL,
         }
     )
+
+
+def upper_limit(base_price: float) -> int:
+    """KRX 상한가 (기준가 +30%, 호가단위 미만 절사). 시장가 매수가능수량의 계산단가."""
+    px = base_price * 1.3
+    tick = krx_tick_size(px)
+    return int(math.floor(px / tick) * tick)
+
+
+def psbl_output(cash: int, calc_price: int, *, max_cash: int | None = None) -> dict:
+    """inquire-psbl-order output (공식 샘플 chk_inquire_psbl_order.py 의 컬럼). 미수 미사용 계좌.
+
+    수량 = 금액 // 계산단가. 시장가 조회면 계산단가는 상한가, 지정가면 주문단가.
+    """
+    mx = cash if max_cash is None else max_cash
+    return ok(
+        output={
+            "ord_psbl_cash": str(cash),
+            "ord_psbl_sbst": "0",
+            "ruse_psbl_amt": "0",
+            "fund_rpch_chgs": "0",
+            "psbl_qty_calc_unpr": str(calc_price),
+            "nrcvb_buy_amt": str(cash),
+            "nrcvb_buy_qty": str(cash // calc_price),
+            "max_buy_amt": str(mx),
+            "max_buy_qty": str(mx // calc_price),
+            "cma_evlu_amt": "0",
+            "ovrs_re_use_amt_wcrc": "0",
+            "ord_psbl_frcr_amt_wcrc": "0",
+        }
+    )
+
+
+def add_psbl(rsps: responses.RequestsMock, cash: int, calc_price: int, base: str = PAPER_BASE_URL) -> None:
+    rsps.add(responses.GET, base + PATH_PSBL_ORDER, json=psbl_output(cash, calc_price))
+
+
+def kis_urls(rsps: responses.RequestsMock) -> list[str]:
+    return [c.request.url.split("?")[0] for c in rsps.calls]
 
 
 # ============================================================================ 순수 로직
@@ -1406,8 +1450,10 @@ class TestBalances:
 
 # ============================================================================ 주문
 class TestOrders:
-    def test_market_buy_sandbox(self, tmp_path, rsps):
+    def test_market_buy_sandbox(self, tmp_path, rsps, daily_candles):
         add_token(rsps)
+        close = daily_candles[-1].close
+        add_psbl(rsps, cash=int(close * 100), calc_price=upper_limit(close))  # 3주는 상한가 기준으로도 충분
         rsps.add(
             responses.POST,
             PAPER_BASE_URL + PATH_ORDER_CASH,
@@ -1416,9 +1462,14 @@ class TestOrders:
         b = make_broker(tmp_path)
         with freeze_time("2025-09-26 03:00:00+00:00"):
             order = b.place_order(SYMBOL, OrderSide.BUY, 3.7)
-        req = rsps.calls[1].request
+        assert kis_urls(rsps) == [
+            PAPER_BASE_URL + PATH_TOKEN,
+            PAPER_BASE_URL + PATH_PSBL_ORDER,
+            PAPER_BASE_URL + PATH_ORDER_CASH,
+        ]
+        req = rsps.calls[2].request
         assert req.headers["tr_id"] == "VTTC0012U"
-        assert body_of(rsps.calls[1]) == {
+        assert body_of(rsps.calls[2]) == {
             "CANO": "50012345",
             "ACNT_PRDT_CD": "01",
             "PDNO": SYMBOL,
@@ -1457,6 +1508,8 @@ class TestOrders:
     def test_buy_real_and_sell_sandbox_tr_ids(self, tmp_path, rsps, daily_candles):
         add_token(rsps, base=REAL_BASE_URL)
         add_token(rsps)
+        px = int(round_to_tick(daily_candles[-1].close))
+        add_psbl(rsps, cash=px * 10, calc_price=px, base=REAL_BASE_URL)
         rsps.add(responses.POST, REAL_BASE_URL + PATH_ORDER_CASH, json=order_output("1"))
         rsps.add(responses.POST, PAPER_BASE_URL + PATH_ORDER_CASH, json=order_output("2"))
         make_broker(tmp_path / "r", sandbox=False).place_order(
@@ -1472,6 +1525,8 @@ class TestOrders:
             REAL_BASE_URL + PATH_ORDER_CASH: "TTTC0012U",
             PAPER_BASE_URL + PATH_ORDER_CASH: "VTTC0011U",
         }
+        psbl = [c for c in rsps.calls if c.request.url.startswith(REAL_BASE_URL + PATH_PSBL_ORDER)]
+        assert len(psbl) == 1 and psbl[0].request.headers["tr_id"] == "TTTC8908R"
 
     def test_order_validation(self, tmp_path, rsps, daily_candles):
         b = make_broker(tmp_path)
@@ -1487,8 +1542,10 @@ class TestOrders:
             b.place_order(SYMBOL, OrderSide.BUY, 1, OrderType.LIMIT, price=-1)
         assert len(rsps.calls) == 0  # 검증 실패는 네트워크 호출 전에
 
-    def test_order_rejected_maps_errors(self, tmp_path, rsps):
+    def test_order_rejected_maps_errors(self, tmp_path, rsps, daily_candles):
         add_token(rsps)
+        close = daily_candles[-1].close
+        add_psbl(rsps, cash=int(close * 10), calc_price=upper_limit(close))
         rsps.add(
             responses.POST,
             PAPER_BASE_URL + PATH_ORDER_CASH,
@@ -1513,8 +1570,10 @@ class TestOrders:
         with pytest.raises(OrderError, match="ODNO"):
             b.place_order(SYMBOL, OrderSide.BUY, 1)
 
-    def test_post_is_not_retried_on_network_error(self, tmp_path, rsps, no_sleep):
+    def test_post_is_not_retried_on_network_error(self, tmp_path, rsps, no_sleep, daily_candles):
         add_token(rsps)
+        close = daily_candles[-1].close
+        add_psbl(rsps, cash=int(close * 10), calc_price=upper_limit(close))
         rsps.add(
             responses.POST,
             PAPER_BASE_URL + PATH_ORDER_CASH,
@@ -1523,10 +1582,12 @@ class TestOrders:
         rsps.add(responses.POST, PAPER_BASE_URL + PATH_ORDER_CASH, json=order_output("9"))
         with pytest.raises(BrokerError, match="네트워크"):
             make_broker(tmp_path).place_order(SYMBOL, OrderSide.BUY, 1)
-        assert len(rsps.calls) == 2  # token + 1 attempt
+        assert len(rsps.calls) == 3  # token + 매수가능조회 + 1 attempt
 
-    def test_order_token_expiry_refreshes_once(self, tmp_path, rsps):
+    def test_order_token_expiry_refreshes_once(self, tmp_path, rsps, daily_candles):
         add_token(rsps, token="old")
+        close = daily_candles[-1].close
+        add_psbl(rsps, cash=int(close * 10), calc_price=upper_limit(close))
         rsps.add(
             responses.POST,
             PAPER_BASE_URL + PATH_ORDER_CASH,
@@ -1540,6 +1601,8 @@ class TestOrders:
 
     def test_cancel_uses_cached_orgno(self, tmp_path, rsps, daily_candles):
         add_token(rsps)
+        px = int(round_to_tick(daily_candles[-1].close))
+        add_psbl(rsps, cash=px * 10, calc_price=px)
         rsps.add(responses.POST, PAPER_BASE_URL + PATH_ORDER_CASH, json=order_output("0000117057", "91252"))
         rsps.add(
             responses.POST,
@@ -1549,9 +1612,9 @@ class TestOrders:
         b = make_broker(tmp_path)
         order = b.place_order(SYMBOL, OrderSide.BUY, 1, OrderType.LIMIT, price=daily_candles[-1].close)
         assert b.cancel_order(order.id) is True
-        req = rsps.calls[2].request
+        req = rsps.calls[3].request
         assert req.headers["tr_id"] == "VTTC0013U"
-        assert body_of(rsps.calls[2]) == {
+        assert body_of(rsps.calls[3]) == {
             "CANO": "50012345",
             "ACNT_PRDT_CD": "01",
             "KRX_FWDG_ORD_ORGNO": "91252",
@@ -1563,7 +1626,7 @@ class TestOrders:
             "QTY_ALL_ORD_YN": "Y",
             "EXCG_ID_DVSN_CD": "KRX",
         }
-        assert len(rsps.calls) == 3  # 조회 없이 캐시된 조직번호 사용
+        assert len(rsps.calls) == 4  # token + 매수가능조회 + 주문 + 취소: 조회 없이 캐시된 조직번호 사용
 
     def test_cancel_looks_up_order_when_unknown(self, tmp_path, rsps, daily_candles):
         add_token(rsps)
@@ -1629,8 +1692,10 @@ class TestOrders:
             assert b.cancel_order("0000000777") is False
         assert len(rsps.calls) == 2
 
-    def test_cancel_error(self, tmp_path, rsps):
+    def test_cancel_error(self, tmp_path, rsps, daily_candles):
         add_token(rsps)
+        close = daily_candles[-1].close
+        add_psbl(rsps, cash=int(close * 10), calc_price=upper_limit(close))
         rsps.add(responses.POST, PAPER_BASE_URL + PATH_ORDER_CASH, json=order_output("0000000001", "91252"))
         rsps.add(
             responses.POST,
@@ -1641,6 +1706,146 @@ class TestOrders:
         b.place_order(SYMBOL, OrderSide.BUY, 1)
         with pytest.raises(OrderError, match="APBK0919"):
             b.cancel_order("0000000001")
+
+
+class TestBuyingPower:
+    """시장가 매수는 ORD_UNPR=0 이라 서버가 상한가 × 수량을 주문가능금액에서 잡는다 (공식 order_cash 안내).
+
+    현재가로 사이징한 수량을 그대로 보내면 예수금의 약 77% 를 넘는 순간 APBK0918 로 거부되므로 주문 전에
+    매수가능조회(inquire-psbl-order, ORD_DVSN=01) 로 수량을 nrcvb_buy_qty 이하로 맞춰야 한다.
+    """
+
+    def test_market_buy_capped_at_buyable_quantity(self, tmp_path, rsps, daily_candles, caplog):
+        add_token(rsps)
+        close = daily_candles[-1].close
+        limit_up = upper_limit(close)
+        cash = int(close * 14)  # 현재가 기준으로는 14주가 들어가는 예수금
+        requested = 14
+        buyable = cash // limit_up  # 상한가 기준 가능 수량 (≈ 14 / 1.3 → 10)
+        assert 0 < buyable < requested
+        add_psbl(rsps, cash=cash, calc_price=limit_up)
+        rsps.add(responses.POST, PAPER_BASE_URL + PATH_ORDER_CASH, json=order_output("0000117058"))
+        b = make_broker(tmp_path)
+        with caplog.at_level("WARNING", logger="tradingbot.brokers.kis"):
+            order = b.place_order(SYMBOL, OrderSide.BUY, requested)
+        # 매수가능조회: 공식 파라미터, 시장가는 ORD_UNPR 공란 (공식 샘플 "시장가로 조회 시 공란으로 입력")
+        psbl = rsps.calls[1].request
+        assert psbl.headers["tr_id"] == "VTTC8908R"
+        assert query(psbl) == {
+            "CANO": "50012345",
+            "ACNT_PRDT_CD": "01",
+            "PDNO": SYMBOL,
+            "ORD_UNPR": "",
+            "ORD_DVSN": "01",
+            "CMA_EVLU_AMT_ICLD_YN": "N",
+            "OVRS_ICLD_YN": "N",
+        }
+        sent = body_of(rsps.calls[2])
+        assert sent["ORD_DVSN"] == "01" and sent["ORD_UNPR"] == "0"
+        assert sent["ORD_QTY"] == str(buyable)
+        assert int(sent["ORD_QTY"]) * limit_up <= cash  # 서버가 잡는 상한가 × 수량이 주문가능금액 이내
+        assert order.quantity == float(buyable) and order.raw["ORD_QTY"] == str(buyable)
+        assert any("축소" in r.getMessage() and str(buyable) in r.getMessage() for r in caplog.records)
+
+    def test_market_buy_within_buyable_quantity_is_not_changed(self, tmp_path, rsps, daily_candles, caplog):
+        add_token(rsps)
+        close = daily_candles[-1].close
+        limit_up = upper_limit(close)
+        add_psbl(rsps, cash=limit_up * 5, calc_price=limit_up)  # 상한가 기준으로 정확히 5주
+        rsps.add(responses.POST, PAPER_BASE_URL + PATH_ORDER_CASH, json=order_output("0000117059"))
+        with caplog.at_level("WARNING", logger="tradingbot.brokers.kis"):
+            order = make_broker(tmp_path).place_order(SYMBOL, OrderSide.BUY, 5)
+        assert body_of(rsps.calls[2])["ORD_QTY"] == "5" and order.quantity == 5.0
+        assert not any("축소" in r.getMessage() for r in caplog.records)
+
+    def test_zero_buyable_quantity_raises_before_sending_order(self, tmp_path, rsps, daily_candles):
+        add_token(rsps)
+        close = daily_candles[-1].close
+        add_psbl(rsps, cash=int(close * 0.5), calc_price=upper_limit(close))  # 1주도 못 산다
+        rsps.add(responses.POST, PAPER_BASE_URL + PATH_ORDER_CASH, json=order_output("1"))
+        with pytest.raises(InsufficientFunds, match="매수가능수량 0주") as ei:
+            make_broker(tmp_path).place_order(SYMBOL, OrderSide.BUY, 1)
+        assert ei.value.payload["nrcvb_buy_qty"] == "0"
+        assert kis_urls(rsps) == [
+            PAPER_BASE_URL + PATH_TOKEN,
+            PAPER_BASE_URL + PATH_PSBL_ORDER,
+        ]  # 주문 안 나감
+
+    def test_limit_buy_queries_with_limit_price(self, tmp_path, rsps, daily_candles):
+        add_token(rsps)
+        px = int(round_to_tick(daily_candles[-1].close))
+        add_psbl(rsps, cash=px * 5, calc_price=px)  # 지정가: 계산단가 = 주문단가
+        rsps.add(responses.POST, PAPER_BASE_URL + PATH_ORDER_CASH, json=order_output("5"))
+        order = make_broker(tmp_path).place_order(SYMBOL, OrderSide.BUY, 7, OrderType.LIMIT, price=px)
+        q = query(rsps.calls[1].request)
+        assert q["ORD_DVSN"] == "00" and q["ORD_UNPR"] == str(px)
+        sent = body_of(rsps.calls[2])
+        assert sent["ORD_DVSN"] == "00" and sent["ORD_UNPR"] == str(px) and sent["ORD_QTY"] == "5"
+        assert order.quantity == 5.0 and order.price == float(px)
+
+    def test_sell_does_not_query_buying_power(self, tmp_path, rsps):
+        add_token(rsps)
+        rsps.add(responses.POST, PAPER_BASE_URL + PATH_ORDER_CASH, json=order_output("3"))
+        make_broker(tmp_path).place_order(SYMBOL, OrderSide.SELL, 2)
+        assert kis_urls(rsps) == [PAPER_BASE_URL + PATH_TOKEN, PAPER_BASE_URL + PATH_ORDER_CASH]
+
+    def test_query_business_error_falls_back_to_requested_quantity(self, tmp_path, rsps, caplog):
+        add_token(rsps)
+        rsps.add(
+            responses.GET,
+            PAPER_BASE_URL + PATH_PSBL_ORDER,
+            json=kis_error("OPSQ0002", "조회할 수 없는 종목코드 입니다."),
+        )
+        rsps.add(responses.POST, PAPER_BASE_URL + PATH_ORDER_CASH, json=order_output("8"))
+        with caplog.at_level("WARNING", logger="tradingbot.brokers.kis"):
+            order = make_broker(tmp_path).place_order(SYMBOL, OrderSide.BUY, 4)
+        assert body_of(rsps.calls[2])["ORD_QTY"] == "4" and order.quantity == 4.0  # 최종 판정은 서버
+        assert any("매수가능조회 실패" in r.getMessage() for r in caplog.records)
+
+    def test_query_auth_error_propagates_without_order(self, tmp_path, rsps):
+        add_token(rsps, token="old")
+        rsps.add(responses.GET, PAPER_BASE_URL + PATH_PSBL_ORDER, status=401, json={"error": "unauthorized"})
+        add_token(rsps, token="new")
+        rsps.add(responses.GET, PAPER_BASE_URL + PATH_PSBL_ORDER, status=401, json={"error": "unauthorized"})
+        rsps.add(responses.POST, PAPER_BASE_URL + PATH_ORDER_CASH, json=order_output("8"))
+        with pytest.raises(AuthenticationError):
+            make_broker(tmp_path).place_order(SYMBOL, OrderSide.BUY, 1)
+        assert not any(u.endswith(PATH_ORDER_CASH) for u in kis_urls(rsps))
+
+    def test_get_buying_power_parses_official_fields_real_tr_id(self, tmp_path, rsps, daily_candles):
+        add_token(rsps, base=REAL_BASE_URL)
+        close = daily_candles[-1].close
+        limit_up = upper_limit(close)
+        cash, max_cash = int(close * 20), int(close * 50)
+        rsps.add(
+            responses.GET,
+            REAL_BASE_URL + PATH_PSBL_ORDER,
+            json=psbl_output(cash, limit_up, max_cash=max_cash),
+        )
+        bp = make_broker(tmp_path, sandbox=False).get_buying_power(" 005930 ")
+        req = rsps.calls[1].request
+        assert req.headers["tr_id"] == "TTTC8908R"
+        assert query(req)["PDNO"] == SYMBOL and query(req)["ORD_DVSN"] == "01"
+        assert isinstance(bp, KISBuyingPower) and bp.symbol == SYMBOL
+        assert bp.cash == bp.amount == float(cash)
+        assert bp.quantity == cash // limit_up
+        assert bp.max_amount == float(max_cash) and bp.max_quantity == max_cash // limit_up
+        assert bp.calc_price == float(limit_up)
+        assert bp.raw["nrcvb_buy_qty"] == str(cash // limit_up)
+
+    def test_get_buying_power_validation(self, tmp_path, rsps, daily_candles):
+        add_token(rsps)
+        rsps.add(responses.GET, PAPER_BASE_URL + PATH_PSBL_ORDER, json=ok(output={"ord_psbl_cash": "0"}))
+        b = make_broker(tmp_path)
+        with pytest.raises(OrderError, match="price"):
+            b.get_buying_power(SYMBOL, OrderType.LIMIT)
+        with pytest.raises(OrderError, match="STOP"):
+            b.get_buying_power(SYMBOL, OrderType.STOP, price=daily_candles[-1].close)
+        with pytest.raises(AuthenticationError, match="KIS_ACCOUNT_NO"):
+            make_broker(tmp_path, account=None).get_buying_power(SYMBOL)
+        assert len(rsps.calls) == 0
+        with pytest.raises(BrokerError, match="nrcvb_buy_qty"):
+            b.get_buying_power(SYMBOL)
 
 
 class TestOrderLookup:
@@ -1887,6 +2092,35 @@ class TestThrottle:
         rsps.add(responses.GET, PAPER_BASE_URL + PATH_PRICE, json=price_output(daily_candles[-1].close))
         make_broker(tmp_path, request_interval=0.2).get_ticker(SYMBOL)
         assert len(slept) == 1 and slept[0] == approx(0.19)
+
+    def test_default_interval_follows_official_sample(self, tmp_path, monkeypatch):
+        """공식 샘플 kis_auth.py: 실전 0.05s, 모의 0.5s (모의 서버는 초당 한도가 낮다)."""
+        assert (PAPER_REQUEST_INTERVAL, REAL_REQUEST_INTERVAL) == (0.5, 0.05)
+        assert make_broker(tmp_path, request_interval=None).request_interval == 0.5
+        assert make_broker(tmp_path, sandbox=False, request_interval=None).request_interval == 0.05
+        assert make_broker(tmp_path, request_interval=0.2).request_interval == 0.2
+        assert KISBroker(token_path=tmp_path / "t.json").request_interval == 0.5  # sandbox 기본값
+        # from_config: extra.request_interval 이 없으면 기본값, 있으면 그대로
+        monkeypatch.setenv("KIS_APP_KEY", APP_KEY)
+        monkeypatch.setenv("KIS_APP_SECRET", APP_SECRET)
+        monkeypatch.setenv("KIS_ACCOUNT_NO", ACCOUNT)
+        base = {"symbols": [SYMBOL], "interval": "1d"}
+        for sandbox, extra, expected in (
+            (True, {}, 0.5),
+            (False, {}, 0.05),
+            (True, {"request_interval": 0.1}, 0.1),
+        ):
+            cfg = AppConfig.model_validate(
+                {
+                    "broker": {
+                        "name": "kis",
+                        "sandbox": sandbox,
+                        "extra": {"token_path": str(tmp_path / "tok.json"), **extra},
+                    },
+                    **base,
+                }
+            )
+            assert KISBroker.from_config(cfg).request_interval == expected
 
     def test_close_is_safe(self, tmp_path):
         b = make_broker(tmp_path)

@@ -6,20 +6,35 @@
 한 사이클(``run_once``) 의 흐름 (심볼별):
 1. ``broker.is_market_open()`` 이 거짓이면(주식 장외) 건너뛴다. ``close_positions_at_market_close`` 가 켜져 있고
    장 마감 직전(다음 폴링이 마감 이후)이면 보유 포지션을 전량 청산하고 신규 진입을 막는다.
-2. ``get_candles`` 로 완성 캔들을 받고, 마지막 완성 캔들이 상태의 ``last_candle_ts`` 보다 새로우면 "새 캔들" 이벤트:
-   a. ``max_holding_bars`` 가 지난 포지션을 시장가 청산 (진입 신호 캔들 이후 완성된 캔들 수로 계산)
+   마감 판정 창은 ``poll_seconds + 직전 사이클 소요 시간`` 이다 (사이클 시작 간격은 poll 보다 길 수 있다).
+2. ``get_candles`` 로 완성 캔들을 받는다.
+   a. ``max_holding_bars`` 가 지난 포지션을 시장가 청산 (진입 신호 캔들 이후 완성된 캔들 수로 계산).
+      **매 폴링** 판정하므로 매도가 미체결로 끝나도 다음 폴링에 다시 시도한다.
+   마지막 완성 캔들이 상태의 ``last_candle_ts`` 보다 새로우면 "새 캔들" 이벤트:
    b. ``strategy.generate_signal`` (prepare + 마지막 행 signal_at)
    c. BUY MARKET/LIMIT 이고 포지션이 없으면 ``risk.can_open`` → ``position_size`` → 주문 → 체결 대기 → ``risk.apply_entry``
    d. BUY STOP 이면 ``pending_breakouts[sym]`` 에 "진행중 캔들 시가 + stop_offset" 트리거를 등록 (다음 캔들 시작에 만료)
    e. SELL 이고 포지션이 있으면 전량 시장가 매도 → ``Trade`` 기록 → ``risk.record_trade``
 3. 매 폴링: 현재가 조회 → 돌파 대기 주문 트리거 판정 → ``risk.check_exit`` (손절/추적손절/익절)
-4. 상태 저장 (positions, pending_breakouts, last_candle_ts, trades, risk, paper broker).
+4. 상태 저장 (positions, pending_breakouts, last_candle_ts, trades, risk, paper broker, inflight_entries).
+
+주문 안전 장치 (실거래 중복 주문 방지)
+- 매수 주문은 **전송 직전**에 신호 캔들을 소비 처리하고(``last_candle_ts`` 갱신) ``inflight_entries`` 에 기록한 뒤
+  상태를 저장한다. 전송 후 오류(응답 유실/타임아웃/파싱 오류)나 크래시가 나도 같은 캔들을 다시 평가해 재주문하지
+  않는다. 돌파 대기(STOP) 경로도 같은 ``_enter`` 를 타므로 동일하다.
+- 결과를 모르는 매수 주문은 ``_reconcile_inflight`` 가 거래소 기준으로 확정한다: 남은 미체결 매수는 취소하고
+  (엔진은 ``fill_timeout_sec`` 뒤 취소하는 정책이므로 동일), 체결된 수량은 원래 신호(손절/최대 보유 기간/진입 캔들)로
+  포지션에 채택한다. 확정될 때까지 그 심볼의 신규 매수는 보류한다. 재시작 시에도 가장 먼저 수행한다.
+- 체결/청산 직후마다 상태를 저장해 크래시로 잃는 구간을 최소화한다.
+- 상태 파일의 ``mode``/``broker`` 가 현재와 다르면(모의투자 → 실거래 전환 등) 복원하지 않고 보관만 한다.
 
 설계 원칙
 - ``run_once`` 는 주입된 ``clock`` / ``broker`` / ``sleep`` 만으로 결정적으로 동작한다 (내부 sleep 없음.
   체결 대기 폴링만 주입된 ``sleep`` 을 쓴다).
 - 심볼 하나의 오류가 다른 심볼 처리를 막지 않는다. 오류는 로그 + 알림(같은 내용은 10분에 1회) 후 계속.
 - 연속 실패 시 ``run_forever`` 가 지수 백오프(최대 5분) 한다. SIGINT/SIGTERM → 상태 저장 후 종료.
+- ``run_forever`` 는 사이클 소요 시간을 대기에서 빼서 사이클 시작 간격을 ``poll_seconds`` 로 유지한다.
+- 당일 시작 자산 기록(``risk.start_day``)이 실패하면 기록될 때까지 매 폴링 다시 시도한다 (일일 손실 한도 유지).
 - 비밀값(키/토큰/웹훅 URL)은 로그/알림에 남기지 않는다 (``mask_secrets``).
 - 데모/샘플 시세는 없다. 모든 가격은 브로커(실거래 API 또는 PaperBroker 의 data_source)에서 온다.
 """
@@ -83,6 +98,7 @@ __all__ = [
     "MAX_BACKOFF_SEC",
     "MAX_SAVED_TRADES",
     "STATE_VERSION",
+    "InflightEntry",
     "PendingBreakout",
     "Trader",
 ]
@@ -186,6 +202,55 @@ class PendingBreakout:
             raise DataError(f"PendingBreakout 복원 실패: {e}") from e
 
 
+@dataclass
+class InflightEntry:
+    """전송했지만 결과(체결/취소)를 아직 상태에 반영하지 못한 매수 주문.
+
+    ``_enter`` 가 ``place_order`` 직전에 기록·저장하고, 체결 확인이 끝나면 지운다. 전송 후 오류나 크래시가 나면
+    ``_reconcile_inflight`` 가 거래소 기준으로 확정(미체결 취소 / 체결분 채택)할 때까지 남는다.
+
+    - ``signal``: 원래 진입 신호 (채택 시 손절/익절/최대 보유 기간을 이 신호로 적용)
+    - ``bar_ts``: 신호 캔들 시각 (포지션의 ``entry_bar_ts``)
+    - ``quantity`` / ``order_type``: 전송한 주문 (로그/점검용)
+    """
+
+    symbol: str
+    signal: Signal
+    bar_ts: datetime | None
+    created_at: datetime
+    quantity: float
+    order_type: str = OrderType.MARKET.value
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "signal": serialize_signal(self.signal),
+            "bar_ts": dt_to_iso(self.bar_ts),
+            "created_at": dt_to_iso(self.created_at),
+            "quantity": float(self.quantity),
+            "order_type": self.order_type,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Any) -> InflightEntry:
+        if not isinstance(d, dict):
+            raise DataError(f"InflightEntry 데이터는 dict 여야 합니다: {type(d).__name__}")
+        try:
+            created = dt_from_iso(d.get("created_at"))
+            if created is None:
+                raise DataError("InflightEntry 에 created_at 이 없습니다")
+            return cls(
+                symbol=str(d["symbol"]),
+                signal=deserialize_signal(d["signal"]),
+                bar_ts=dt_from_iso(d.get("bar_ts")),
+                created_at=created,
+                quantity=float(d.get("quantity", 0.0) or 0.0),
+                order_type=str(d.get("order_type") or OrderType.MARKET.value),
+            )
+        except (KeyError, TypeError, ValueError) as e:
+            raise DataError(f"InflightEntry 복원 실패: {e}") from e
+
+
 class Trader:
     """실시간(모의/실거래) 매매 루프.
 
@@ -224,6 +289,10 @@ class Trader:
         self._last_candle_ts: dict[str, datetime] = {}
         self._trades: list[Trade] = []
         self._last_prices: dict[str, float] = {}
+        # 결과 미확인 매수 주문 (심볼별 최대 1건)
+        self._inflight: dict[str, InflightEntry] = {}
+        # 지금 "새 캔들" 이벤트로 평가 중인 캔들 시각 (주문 전송 시 소비 처리용)
+        self._evaluating: dict[str, datetime] = {}
 
         # 루프 제어
         self._stop_event = threading.Event()
@@ -231,6 +300,7 @@ class Trader:
         self._running = False
         self._started_at: datetime | None = None
         self._last_cycle_at: datetime | None = None
+        self._last_cycle_seconds = 0.0
         self._cycles = 0
         self._cycle_errors = 0
         self.consecutive_failures = 0
@@ -267,6 +337,11 @@ class Trader:
     @property
     def trades(self) -> list[Trade]:
         return list(self._trades)
+
+    @property
+    def inflight_entries(self) -> dict[str, InflightEntry]:
+        """결과를 아직 확정하지 못한 매수 주문 (복사본)."""
+        return dict(self._inflight)
 
     @property
     def started(self) -> bool:
@@ -316,6 +391,9 @@ class Trader:
 
         data = self.state.load()
         self._restore(data, now)
+        # 크래시 전에 전송한 매수 주문은 동기화 옵션과 무관하게 먼저 확정한다 (중복 주문 방지)
+        for sym in list(self._inflight):
+            self._reconcile_inflight(sym, now)
         if self.config.engine.sync_positions_on_start:
             self._sync_positions(now)
         self._init_day(data, now)
@@ -377,9 +455,25 @@ class Trader:
             )
             return
 
+        saved_mode = data.get("mode")
+        saved_broker = data.get("broker")
+        if saved_mode not in (None, self.config.mode) or saved_broker not in (None, self.broker.name):
+            # 모의투자 상태(모의 손익/거래/포지션/당일 시작 자산)를 실거래에 이어 쓰면 일일 손실 한도가 모의 자산
+            # 기준으로 계산되는 등 리스크 통제가 어긋난다 → 복원하지 않고 파일만 보관한다.
+            label = f"{saved_mode or 'unknown'}-{saved_broker or 'unknown'}"
+            backup = self.state.archive(label)
+            msg = (
+                f"상태 파일은 {saved_mode or '?'} 모드 / 브로커 {saved_broker or '?'} 에서 저장된 것이라 "
+                f"현재 {self.config.mode} / {self.broker.name} 에 복원하지 않습니다"
+                + (f" (보관: {backup.name})" if backup is not None else "")
+                + " — 포지션은 거래소 동기화로, 당일 시작 자산은 현재 계좌로 새로 기록합니다"
+            )
+            logger.warning(msg)
+            self.notifier.send(f"[경고] {msg}")
+            return
+
         saved_interval = data.get("interval")
         saved_strategy = data.get("strategy")
-        saved_broker = data.get("broker")
         same_interval = saved_interval in (None, self.interval)
         same_strategy = saved_strategy in (None, self.strategy.name)
         if not same_interval:
@@ -394,9 +488,6 @@ class Trader:
                 saved_strategy,
                 self.strategy.name,
             )
-        if saved_broker not in (None, self.broker.name):
-            logger.warning("상태의 브로커 %s 와 현재 브로커 %s 가 다릅니다", saved_broker, self.broker.name)
-
         if isinstance(self.broker, PaperBroker):
             paper = data.get("paper_broker")
             if isinstance(paper, dict) and paper:
@@ -434,6 +525,13 @@ class Trader:
                     continue
                 self._pending[str(sym)] = pb
 
+        # 결과 미확인 매수 주문은 실제 거래소 상태이므로 interval/전략과 무관하게 복원한다
+        for sym, ie_ in (data.get("inflight_entries") or {}).items():
+            try:
+                self._inflight[str(sym)] = InflightEntry.from_dict(ie_)
+            except DataError as e:
+                logger.error("%s 결과 미확인 주문 기록 복원 실패 — 거래소에서 직접 확인하세요: %s", sym, e)
+
         for t in data.get("trades") or []:
             try:
                 self._trades.append(deserialize_trade(t))
@@ -443,11 +541,12 @@ class Trader:
 
         self.risk.from_dict(data.get("risk"))
         logger.info(
-            "상태 복원 (%s): 포지션 %d, 돌파 대기 %d, 거래 %d, 마지막 캔들 %s",
+            "상태 복원 (%s): 포지션 %d, 돌파 대기 %d, 거래 %d, 결과 미확인 주문 %d, 마지막 캔들 %s",
             data.get("updated_at", "?"),
             len(self._positions),
             len(self._pending),
             len(self._trades),
+            len(self._inflight),
             {s: dt_to_iso(t) for s, t in self._last_candle_ts.items()},
         )
 
@@ -513,6 +612,8 @@ class Trader:
             mine = self._positions.get(sym)
             if mine is None:
                 self._adopt_position(sym, bpos, now)
+                if self._pending.pop(sym, None) is not None:
+                    logger.info("%s 보유 중이라 저장된 돌파 대기 주문을 제거합니다", sym)
                 continue
             if abs(bpos.quantity - mine.quantity) > _tol(mine.quantity):
                 logger.warning(
@@ -542,7 +643,17 @@ class Trader:
                 logger.warning(msg)
                 self.notifier.send(f"[동기화] {msg}")
 
-    def _adopt_position(self, sym: str, bpos: Position, now: datetime) -> None:
+    def _adopt_position(
+        self,
+        sym: str,
+        bpos: Position,
+        now: datetime,
+        *,
+        signal: Signal | None = None,
+        bar_ts: datetime | None = None,
+        label: str = "거래소 보유 포지션 채택",
+    ) -> bool:
+        """거래소 포지션을 상태에 채택한다. ``signal`` 이 있으면 그 신호(손절/익절/최대 보유 기간)로 진입 처리."""
         avg = float(bpos.average_price) if _positive(bpos.average_price) else None
         note = ""
         if avg is None:
@@ -552,10 +663,10 @@ class Trader:
                 logger.error(
                     "%s 평균단가와 현재가를 모두 알 수 없어 포지션을 채택하지 못했습니다: %s", sym, e
                 )
-                return
+                return False
             if not _positive(avg):
                 logger.error("%s 현재가가 유효하지 않아 포지션을 채택하지 못했습니다: %r", sym, avg)
-                return
+                return False
             note = " (평균단가 미상 → 현재가 사용)"
         pos = Position(
             symbol=sym,
@@ -567,16 +678,21 @@ class Trader:
             take_profit=bpos.take_profit,
             meta=dict(bpos.meta),
         )
-        if pos.stop_loss is None and pos.take_profit is None:
+        if signal is not None:
+            if bar_ts is not None:
+                signal.meta["entry_bar_ts"] = dt_to_iso(bar_ts)
+            self.risk.apply_entry(pos, signal, avg)
+        elif pos.stop_loss is None and pos.take_profit is None:
             self.risk.apply_entry(
                 pos, Signal(action=SignalAction.BUY, symbol=sym, reason="거래소 보유 포지션 동기화"), avg
             )
         pos.meta["adopted"] = True
         pos.meta.setdefault("entry_fee", 0.0)
         self._positions[sym] = pos
-        msg = f"{sym} 거래소 보유 포지션 채택: {_fmt_qty(pos.quantity)} @ {_fmt(avg)}{note}"
+        msg = f"{sym} {label}: {_fmt_qty(pos.quantity)} @ {_fmt(avg)}{note}"
         logger.warning(msg)
         self.notifier.send(f"[동기화] {msg}")
+        return True
 
     def _init_day(self, data: dict[str, Any], now: datetime) -> None:
         today = now.date()
@@ -602,6 +718,7 @@ class Trader:
             self.start()
         now = self._now()
         self._roll_day(now)
+        self._ensure_day_start(now)
         self._cycle_errors = 0
 
         try:
@@ -629,6 +746,7 @@ class Trader:
 
         self._cycles += 1
         self._last_cycle_at = self._now()
+        self._last_cycle_seconds = max((self._last_cycle_at - now).total_seconds(), 0.0)
         self._save_state()
 
     def run_forever(self) -> None:
@@ -640,6 +758,7 @@ class Trader:
             if not self._started:
                 self.start()
             while not self._stop_event.is_set():
+                cycle_start = self._now()
                 try:
                     self.run_once()
                 except Exception as e:
@@ -653,7 +772,10 @@ class Trader:
                         self.consecutive_failures = 0
                 if self._stop_event.is_set():
                     break
-                delay = self.next_delay()
+                # 사이클 소요 시간(HTTP 호출, 체결 대기)을 빼서 사이클 "시작" 간격을 poll_seconds 로 유지한다.
+                # 그래야 장 마감 직전 폴링 창(_closing_soon)을 건너뛰지 않는다.
+                elapsed = max((self._now() - cycle_start).total_seconds(), 0.0)
+                delay = max(self.next_delay() - elapsed, 0.0)
                 if self.consecutive_failures:
                     logger.warning("연속 실패 %d회 → %.0f초 후 재시도", self.consecutive_failures, delay)
                 self._wait(delay)
@@ -733,10 +855,24 @@ class Trader:
             return
         logger.info("UTC 날짜 변경 %s → %s", self._current_day, today)
         self._send_daily_summary(self._current_day)
-        equity = self._safe_equity()
-        if equity is not None:
-            self.risk.start_day(equity, now)
         self._current_day = today
+
+    def _ensure_day_start(self, now: datetime) -> None:
+        """당일 시작 자산이 아직 기록되지 않았으면 기록한다 (자산 조회 실패 시 매 폴링 재시도).
+
+        한 번 실패했다고 그날 내내 일일 손실 한도가 꺼진 채 돌면 안 된다. 당일 거래가 이미 있었으면
+        (``risk.current_day == today``) 현재 자산에서 당일 실현 손익을 뺀 값이 시작 자산이다.
+        """
+        today = now.date()
+        if self.risk.current_day == today and self.risk.day_start_equity is not None:
+            return
+        equity = self._safe_equity()
+        if equity is None:
+            logger.warning("당일(%s) 시작 자산을 기록하지 못했습니다 — 다음 폴링에 다시 시도합니다", today)
+            return
+        if self.risk.current_day == today:
+            equity -= self.risk.daily_pnl
+        self.risk.start_day(equity, now)
 
     def _send_daily_summary(self, day: date) -> None:
         pnl = self.risk.daily_pnl
@@ -777,6 +913,13 @@ class Trader:
             raise DataError(f"{sym} 현재가가 유효하지 않습니다: {price!r}")
         self._last_prices[sym] = price
 
+        # 결과를 모르는 이전 매수 주문이 있으면 먼저 거래소 기준으로 확정한다 (확정 전에는 신규 매수 보류)
+        if sym in self._inflight:
+            self._reconcile_inflight(sym, now)
+
+        # (a) 최대 보유 기간 만료 청산 — 매 폴링 판정 (매도가 미체결로 끝나도 다음 폴링에 재시도)
+        self._check_max_holding(sym, candles, price)
+
         prev = self._last_candle_ts.get(sym)
         if prev is None or last.timestamp > prev:
             logger.info(
@@ -787,7 +930,13 @@ class Trader:
                 _fmt(last.close),
                 _fmt(price),
             )
-            self._on_new_candle(sym, candles, price, now, allow_entry=not closing)
+            # 평가 중 매수 주문을 전송하면 _enter 가 _consume_candle 로 이 캔들을 즉시 소비 처리한다
+            # (전송 후 오류가 나도 다음 폴링에 같은 캔들을 재평가해 재주문하지 않는다).
+            self._evaluating[sym] = last.timestamp
+            try:
+                self._on_new_candle(sym, candles, price, now, allow_entry=not closing)
+            finally:
+                self._evaluating.pop(sym, None)
             self._last_candle_ts[sym] = last.timestamp
 
         if closing:
@@ -816,21 +965,6 @@ class Trader:
         self, sym: str, candles: list[Candle], price: float, now: datetime, *, allow_entry: bool
     ) -> None:
         last = candles[-1]
-
-        # (a) 최대 보유 기간 만료 청산
-        pos = self._positions.get(sym)
-        if pos is not None:
-            mhb = self._max_holding_bars(pos)
-            if mhb is not None:
-                held = self._bars_held(pos, candles)
-                if held is not None and held >= mhb:
-                    self._exit(
-                        sym,
-                        pos,
-                        reason=f"최대 보유 기간 만료 ({held}/{mhb}봉)",
-                        exit_type=EXIT_MAX_HOLDING,
-                        price=price,
-                    )
 
         # 이전 캔들에서 등록한 돌파 대기 주문은 그 캔들이 끝났으므로 무효
         stale = self._pending.pop(sym, None)
@@ -876,6 +1010,24 @@ class Trader:
             self._exit(sym, pos, reason=sig.reason or "전략 매도 신호", exit_type=EXIT_SIGNAL, price=price)
 
     # ------------------------------------------------------------------ 보유 기간
+    def _check_max_holding(self, sym: str, candles: list[Candle], price: float) -> None:
+        """(a) ``max_holding_bars`` 가 지난 포지션을 시장가 청산. 매 폴링 호출되므로 미체결이면 자연히 재시도된다."""
+        pos = self._positions.get(sym)
+        if pos is None:
+            return
+        mhb = self._max_holding_bars(pos)
+        if mhb is None:
+            return
+        held = self._bars_held(pos, candles)
+        if held is not None and held >= mhb:
+            self._exit(
+                sym,
+                pos,
+                reason=f"최대 보유 기간 만료 ({held}/{mhb}봉)",
+                exit_type=EXIT_MAX_HOLDING,
+                price=price,
+            )
+
     @staticmethod
     def _max_holding_bars(pos: Position) -> int | None:
         raw = pos.meta.get("max_holding_bars")
@@ -997,7 +1149,19 @@ class Trader:
         self._enter(sym, sig, price, bar_ts=pb.candle_ts, now=now)
 
     # ------------------------------------------------------------------ 진입
+    def _consume_candle(self, sym: str) -> None:
+        """평가 중인 신호 캔들을 지금 소비 처리한다 (주문 전송 직전에 호출)."""
+        ts = self._evaluating.get(sym)
+        if ts is None:
+            return
+        prev = self._last_candle_ts.get(sym)
+        if prev is None or ts > prev:
+            self._last_candle_ts[sym] = ts
+
     def _enter(self, sym: str, sig: Signal, price: float, *, bar_ts: datetime | None, now: datetime) -> None:
+        if sym in self._inflight:
+            logger.warning("%s 결과를 확인하지 못한 이전 매수 주문이 있어 신규 진입을 보류합니다", sym)
+            return
         open_count = len(self._positions)
         ok, why = self.risk.can_open(open_count, now)
         if not ok:
@@ -1054,14 +1218,34 @@ class Trader:
             self._quote(),
             sig.reason,
         )
-        order = self.broker.place_order(sym, OrderSide.BUY, qty, order_type, limit_price)
-        order = self._await_fill(order, sym)
+        # 전송 직전: 신호 캔들 소비 처리 + 진행중 주문 기록 + 상태 저장 (write-ahead).
+        # 전송 후 오류/크래시가 나도 같은 캔들을 재평가해 재주문하지 않고, 재시작 시 결과를 확정할 수 있다.
+        self._consume_candle(sym)
+        self._inflight[sym] = InflightEntry(
+            symbol=sym,
+            signal=sig,
+            bar_ts=bar_ts,
+            created_at=now,
+            quantity=qty,
+            order_type=order_type.value,
+        )
+        self._save_state()
+        try:
+            order = self.broker.place_order(sym, OrderSide.BUY, qty, order_type, limit_price)
+            order = self._await_fill(order, sym)
+        except Exception:
+            # 거래소가 주문을 받았을 수 있다 (응답 유실/타임아웃/조회 파싱 오류) → 거래소 기준으로 확정
+            self._reconcile_inflight(sym, self._now())
+            self._save_state()
+            raise
+        self._inflight.pop(sym, None)
         filled_qty, fill_price = self._fill_result(order, ref_price)
         if filled_qty <= 0:
             msg = f"{sym} 매수 미체결 (주문 {order.id}, 상태 {order.status.value})"
             logger.warning(msg)
             if self.config.notify.notify_on_error:
                 self._notify_error(f"[오류] {msg}", self._now())
+            self._save_state()
             return
 
         position = Position(
@@ -1076,7 +1260,74 @@ class Trader:
         position.meta["entry_fee"] = float(order.fee or 0.0)
         position.meta["entry_order_id"] = order.id
         self._positions[sym] = position
+        self._save_state()  # 체결 즉시 저장 (사이클 끝까지 기다리지 않는다)
         self._notify_fill(sym, OrderSide.BUY, filled_qty, fill_price, order, sig.reason)
+
+    def _reconcile_inflight(self, sym: str, now: datetime) -> None:
+        """결과를 모르는 매수 주문을 거래소 상태로 확정한다.
+
+        1. 해당 심볼의 미체결 매수 주문은 취소한다 (엔진은 ``fill_timeout_sec`` 뒤 취소하는 정책이므로 동일).
+        2. 거래소 보유 수량이 있고 상태에 포지션이 없으면 원래 신호로 포지션을 채택한다.
+        조회/취소에 실패하면 기록을 남겨 다음 폴링에 다시 시도하고, 그동안 이 심볼의 신규 매수는 막는다.
+        예외를 밖으로 던지지 않는다.
+        """
+        entry = self._inflight.get(sym)
+        if entry is None:
+            return
+        try:
+            open_orders = self.broker.get_open_orders(sym)
+        except Exception as e:
+            logger.error(
+                "%s 결과 미확인 매수 주문 확정 실패 (미체결 조회): %s — 다음 폴링에 재시도",
+                sym,
+                mask_secrets(str(e)),
+            )
+            return
+        for o in open_orders:
+            if o.symbol != sym or OrderSide(o.side) != OrderSide.BUY:
+                continue
+            try:
+                self.broker.cancel_order(o.id, sym)
+            except Exception as e:
+                logger.error(
+                    "%s 결과 미확인 매수 주문 %s 취소 실패: %s — 다음 폴링에 재시도",
+                    sym,
+                    o.id,
+                    mask_secrets(str(e)),
+                )
+                return
+            msg = f"{sym} 결과 미확인 매수 주문 {o.id} 취소 (미체결 {_fmt_qty(o.quantity)} @ {_fmt(o.price)})"
+            logger.warning(msg)
+            self.notifier.send(f"[동기화] {msg}")
+        try:
+            bpos = self._broker_position(sym)
+        except Exception as e:
+            logger.error(
+                "%s 결과 미확인 매수 주문 확정 실패 (보유 조회): %s — 다음 폴링에 재시도",
+                sym,
+                mask_secrets(str(e)),
+            )
+            return
+        del self._inflight[sym]
+        if bpos is None or bpos.quantity <= 0:
+            msg = f"{sym} 결과 미확인 매수 주문 확정: 거래소 보유 없음 (체결되지 않음)"
+            logger.warning(msg)
+            self.notifier.send(f"[동기화] {msg}")
+            return
+        if sym in self._positions:
+            logger.info("%s 결과 미확인 매수 주문 확정: 이미 상태에 포지션이 있어 유지합니다", sym)
+            return
+        adopted = self._adopt_position(
+            sym,
+            bpos,
+            now,
+            signal=entry.signal,
+            bar_ts=entry.bar_ts,
+            label="결과 미확인 매수 주문 확정 — 거래소 체결분 채택",
+        )
+        if not adopted:
+            # 평균단가/현재가 모두 알 수 없는 드문 경우: 다음 폴링에 다시 시도한다
+            self._inflight[sym] = entry
 
     # ------------------------------------------------------------------ 청산
     def _exit(self, sym: str, pos: Position, *, reason: str, exit_type: str, price: float | None) -> None:
@@ -1132,7 +1383,8 @@ class Trader:
         )
         self._trades.append(trade)
         self._trim_trades()
-        self.risk.record_trade(trade)
+        # 당일 집계의 날짜는 엔진 시계 기준 (거래소 체결 시각은 Trade.exit_time 에 그대로 남긴다)
+        self.risk.record_trade(trade, now=self._now())
 
         remaining = pos.quantity - filled_qty
         if remaining <= _tol(pos.quantity):
@@ -1142,18 +1394,22 @@ class Trader:
             pos.meta["entry_fee"] = entry_fee * (1.0 - ratio)
             logger.warning("%s 부분 체결: 잔여 %s 는 포지션으로 유지합니다", sym, _fmt_qty(remaining))
         pos.meta["exit_type"] = exit_type
+        self._save_state()  # 청산 즉시 저장
         self._notify_fill(sym, OrderSide.SELL, filled_qty, exit_price, order, reason, trade=trade)
+
+    def _broker_position(self, sym: str) -> Position | None:
+        """거래소가 보고하는 포지션 (없으면 None). 조회 실패는 예외로 전파."""
+        return self.broker.get_positions().get(sym)
 
     def _broker_held(self, sym: str) -> float | None:
         """거래소가 보고하는 보유 수량 (조회 실패 시 None)."""
         try:
-            positions = self.broker.get_positions()
+            p = self._broker_position(sym)
         except Exception as e:
             logger.warning(
                 "%s 거래소 보유 수량 조회 실패, 상태 수량으로 매도합니다: %s", sym, mask_secrets(str(e))
             )
             return None
-        p = positions.get(sym)
         return float(p.quantity) if p is not None else 0.0
 
     # ------------------------------------------------------------------ 체결 확인
@@ -1275,20 +1531,26 @@ class Trader:
 
     # ------------------------------------------------------------------ 장 마감
     def _closing_soon(self, now: datetime) -> bool:
-        """다음 폴링이 장 마감 이후가 되는 '마지막 폴링' 인지 (주식 + close_positions_at_market_close)."""
+        """다음 폴링이 장 마감 이후가 될 수 있는 '마지막 폴링' 인지 (주식 + close_positions_at_market_close).
+
+        다음 사이클은 ``poll_seconds`` 뒤가 아니라 "poll_seconds + 이번 사이클 소요 시간" 뒤에 시작할 수 있으므로
+        (HTTP 호출, 체결 대기) 직전 사이클 소요 시간만큼 창을 넓힌다. 창이 넓어 두 번 연속 '마감 직전' 으로 판정돼도
+        청산은 멱등이라 무해하지만, 창이 좁아 한 번도 판정되지 않으면 포지션이 다음 장까지 남는다.
+        """
         if not self.config.engine.close_positions_at_market_close:
             return False
         if AssetClass(self.broker.asset_class) != AssetClass.STOCK:
             return False
         poll = float(self.config.engine.poll_seconds)
+        horizon = poll + max(self._last_cycle_seconds, 0.0)
         for obj in (self.broker, getattr(self.broker, "data_source", None)):
             if obj is None:
                 continue
             nxt = getattr(obj, "next_market_close", None)
             if isinstance(nxt, datetime):
                 remaining = (ensure_utc(nxt) - now).total_seconds()
-                return -poll < remaining <= poll
-        later = now + timedelta(seconds=poll)
+                return -poll < remaining <= horizon
+        later = now + timedelta(seconds=horizon)
         for fn in (is_krx_open, is_nyse_open):
             if fn(now) and not fn(later):
                 return True
@@ -1413,6 +1675,7 @@ class Trader:
             "cycles": self._cycles,
             "positions": {s: serialize_position(p) for s, p in self._positions.items()},
             "pending_breakouts": {s: pb.to_dict() for s, pb in self._pending.items()},
+            "inflight_entries": {s: ie.to_dict() for s, ie in self._inflight.items()},
             "last_candle_ts": {s: dt_to_iso(t) for s, t in self._last_candle_ts.items()},
             "trades": [serialize_trade(t) for t in self._trades[-MAX_SAVED_TRADES:]],
             "risk": self.risk.to_dict(),
@@ -1490,6 +1753,15 @@ class Trader:
             "day_start_equity": self.risk.day_start_equity,
             "positions": positions,
             "pending_breakouts": pending,
+            "inflight_entries": {
+                sym: {
+                    "quantity": ie.quantity,
+                    "order_type": ie.order_type,
+                    "created_at": dt_to_iso(ie.created_at),
+                    "reason": ie.signal.reason,
+                }
+                for sym, ie in self._inflight.items()
+            },
             "last_candle_ts": {s: dt_to_iso(t) for s, t in self._last_candle_ts.items()},
             "last_prices": dict(self._last_prices),
             "trades": len(self._trades),
