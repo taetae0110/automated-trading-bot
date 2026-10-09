@@ -696,7 +696,10 @@ th.num,
 .chart-empty {
   position: absolute;
   inset: 0;
+  z-index: 5;
   display: flex;
+  padding: 16px;
+  text-align: center;
   align-items: center;
   justify-content: center;
   color: var(--text-muted);
