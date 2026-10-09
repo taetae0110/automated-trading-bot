@@ -35,7 +35,9 @@ docs/         ARCHITECTURE.md, BROKERS.md(브로커별 키 발급/주의사항),
 - **데모/샘플/가짜 시세 데이터 절대 금지.** 저장소에 샘플 CSV 를 넣지 않고, 코드에 하드코딩된 가격·가짜 잔고·"데모 모드" 를
   만들지 않는다. 백테스트 데이터는 항상 실제 거래소(Upbit 공개 API, ccxt, KIS, Alpaca, yfinance)에서 내려받는다.
   테스트도 `tests/conftest.py` 가 Upbit 공개 API 에서 받아 캐시한 **실제 캔들**(`daily_df`, `candles_df`, `eth_daily_df`)을
-  쓴다. 지표 단위 테스트의 아주 짧은 손계산 검증 벡터(예: [1,2,3,4,5] 의 SMA) 는 허용. 비공개 API(주문/잔고) 테스트는
+  쓴다. 이 실데이터는 `REAL_CANDLE_WINDOW_END`(2026-09-01 12:00 UTC) 직전의 **고정된 200개 구간**이라 모든 실행이 같은 캔들을
+  보며(결정적), 구간을 옮길 때는 전체 테스트로 데이터 전제 skip 이 없는지 확인한다. 지표 단위 테스트의 아주 짧은 손계산 검증
+  벡터(예: [1,2,3,4,5] 의 SMA) 는 허용. 비공개 API(주문/잔고) 테스트는
   거래소 공식 문서의 응답 스키마를 그대로 따르는 HTTP 모킹만 허용하며, 모킹 데이터는 테스트 파일 안에만 둔다.
 - Python 3.10+, 타입 힌트 필수, `from __future__ import annotations`.
 - 모든 datetime 은 **UTC aware**. 거래소 응답의 KST/ET 는 즉시 UTC 로 변환.

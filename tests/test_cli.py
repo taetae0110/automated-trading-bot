@@ -49,12 +49,13 @@ from tradingbot.models import (
     Candle,
     OrderSide,
     OrderType,
+    SignalAction,
     ensure_utc,
     interval_to_seconds,
     utcnow,
 )
 from tradingbot.risk import RiskManager
-from tradingbot.strategies import available_strategies, create_strategy
+from tradingbot.strategies import available_strategies, candles_to_df, create_strategy
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE_CONFIGS = sorted((ROOT / "config" / "examples").glob("*.yaml")) + [
@@ -951,9 +952,11 @@ def test_backtest_auto_downloads_from_broker_when_missing(
     assert feed.calls["get_candles"] >= 1
     assert feed.closed
 
-    # 두 번째 실행은 저장된 CSV 를 쓴다 (다운로드 안 함)
+    # 두 번째 실행은 저장된 CSV 를 쓴다 (다운로드 안 함). 픽스처는 고정된 과거 구간이라 종료일을 주지 않으면
+    # "최신 구간을 덮는가" 검사가 현재 시각 기준이 되어 다시 내려받으므로 저장된 구간을 그대로 요청한다
     before = feed.calls["get_candles"]
-    result = invoke("backtest", "-c", str(cfg), "--start", _date(df["timestamp"].iloc[0]))
+    first, last = df["timestamp"].iloc[0], df["timestamp"].iloc[-1]
+    result = invoke("backtest", "-c", str(cfg), "--start", _date(first), "--end", _date(last))
     assert result.exit_code == 0, result.output
     assert f"데이터 출처 : {BTC} ← csv" in result.output
     assert feed.calls["get_candles"] == before
@@ -1288,11 +1291,16 @@ def test_run_once_paper_mode_writes_state_then_status_and_balance(
     paper = state["paper_broker"]
     assert paper["initial_cash"] == INITIAL_CASH
     assert paper["quote_currency"] == "KRW"
-    # 포지션이 생겼다면 현금이 줄고 상태에도 남는다
-    if state["positions"]:
+    # 전략이 마지막 완성 캔들에서 낸 신호로 포지션 유무를 결정적으로 검증한다 (캔들 구간이 고정된 실데이터).
+    strategy = create_strategy("sma_cross", {"fast": 5, "slow": 20})
+    expected_signal = strategy.generate_signal(BTC, candles_to_df(_complete(daily_candles, "1d")[-60:]))
+    if expected_signal.action == SignalAction.BUY:
+        assert BTC in state["positions"], "매수 신호인데 포지션이 없다"
         assert paper["cash"] < INITIAL_CASH
-        assert BTC in state["positions"]
         assert BTC in result.output
+    else:
+        assert state["positions"] == {}, "매수 신호가 아닌데 포지션이 생겼다"
+        assert paper["cash"] == INITIAL_CASH
 
     result = invoke("status", "-c", str(cfg))
     assert result.exit_code == 0, result.output

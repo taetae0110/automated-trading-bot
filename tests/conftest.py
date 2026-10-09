@@ -4,14 +4,13 @@
 테스트에 쓰는 캔들은 전부 Upbit 공개 API 에서 받은 실제 데이터이며, pytest 캐시에 저장해 재사용한다.
 네트워크가 없으면 해당 테스트는 skip 된다. (CI 는 네트워크가 있으므로 실행된다.)
 
-시간봉 구간 고정: KRW-BTC 시간봉(`candles`/`candles_df`/`real_btc_hourly_raw`) 은 "최신 200개" 가 아니라
-`REAL_HOURLY_WINDOW_END` 직전의 **고정된 과거 200개** 를 받는다 (Upbit `to` 파라미터, 배타적).
-시간봉 200개는 8일 남짓이라, 최신 구간을 받으면 `.pytest_cache/` 가 없는 CI 는 실행마다 다른 8일을 쓰게 되고
-"진입 후 1% 하락/상승" 같은 엔진 손절·익절 테스트의 데이터 전제가 약 5번 중 1번은 성립하지 않아 테스트가 조용히
-skip 되었다. 구간을 고정하면 모든 실행이 같은 실제 캔들을 쓰므로 전제 성립 여부가 결정적이다 (구간을 옮길 때는
-전체 테스트를 돌려 데이터 전제 skip 이 생기지 않는지 확인한다).
-일봉(`daily_candles`/`daily_df`/`eth_daily_df`) 은 200일이라 돌파 일/비돌파 일 같은 전제가 항상 성립하고,
-CLI 의 "저장된 CSV 가 최신 구간을 덮는가" 검사처럼 **현재 시각 기준** 동작을 검증하는 테스트가 쓰므로 최신 구간을 유지한다.
+구간 고정: 실제 캔들은 "최신 200개" 가 아니라 `REAL_CANDLE_WINDOW_END` 직전의 **고정된 과거 200개** 를 받는다
+(Upbit `to` 파라미터, 배타적). 최신 캔들을 받으면 `.pytest_cache/` 가 없는 CI 는 실행마다 다른 구간을 쓰게 되고,
+데이터에 의존하는 전제(진입가 대비 1% 등락, 돌파 일 존재 등)가 어떤 날에는 성립하지 않아 손절/익절 같은 핵심 테스트가
+조용히 skip 되었다 (시간봉 200개는 8일 남짓이라 약 5번 중 1번). 구간을 고정하면 모든 실행이 같은 실제 캔들을 쓰므로
+전제 성립 여부가 결정적이고, BTC 시간봉/일봉과 ETH 일봉이 같은 시각까지 이어진다.
+따라서 "현재 시각" 기준 동작(예: 저장된 CSV 가 최신 구간을 덮는지)을 검증하는 테스트는 종료 시각을 명시해야 한다.
+구간을 옮길 때는 전체 테스트를 돌려 데이터 전제 skip 이 생기지 않는지 확인한다.
 """
 
 from __future__ import annotations
@@ -37,8 +36,9 @@ _UPBIT_INTERVAL_PATH = {
     "1w": "/v1/candles/weeks",
 }
 
-#: KRW-BTC 시간봉 고정 구간의 끝 (UTC, 배타적): 2026-08-24 04:00 ~ 2026-09-01 11:00 의 실제 캔들 200개.
-REAL_HOURLY_WINDOW_END = "2026-09-01T12:00:00Z"
+#: 실제 캔들 구간의 끝 (UTC, 배타적). 모든 픽스처가 이 시각 직전 200개를 받는다:
+#: BTC 시간봉 2026-08-24 04:00 ~ 09-01 11:00, BTC/ETH 일봉 2026-02-14 ~ 09-01.
+REAL_CANDLE_WINDOW_END = "2026-09-01T12:00:00Z"
 
 
 def _parse_utc(s: str) -> datetime:
@@ -46,11 +46,11 @@ def _parse_utc(s: str) -> datetime:
 
 
 def fetch_real_upbit_candles(
-    market: str, interval: str, count: int = 200, to: str | None = None
+    market: str, interval: str, count: int = 200, to: str | None = REAL_CANDLE_WINDOW_END
 ) -> list[dict]:
     """Upbit 공개 API 원본 응답(list[dict], 최신→과거). 실패 시 예외.
 
-    `to`(UTC ISO8601, 배타적) 를 주면 그 직전 `count` 개를, None 이면 최신 `count` 개를 받는다.
+    `to`(UTC ISO8601, 배타적) 직전 `count` 개를 받는다. None 이면 최신 캔들.
     """
     params: dict[str, str | int] = {"market": market, "count": min(count, 200)}
     if to is not None:
@@ -97,9 +97,11 @@ def _check_window(raw: list[dict], market: str, interval: str, count: int, to: s
         )
 
 
-def _cached_real_raw(request, market: str, interval: str, count: int, to: str | None = None) -> list[dict]:
-    window = "latest" if to is None else "to_" + to.replace(":", "").replace("-", "")
-    key = f"tradingbot/upbit/{market}/{interval}/{count}/{window}"
+def _cached_real_raw(request, market: str, interval: str, count: int) -> list[dict]:
+    to = REAL_CANDLE_WINDOW_END
+    # 마지막 요소를 "{count}_to_{끝시각}" 한 파일로 둔다: 예전 레이아웃(`.../{count}` 파일 또는 `.../{count}/latest`
+    # 디렉터리) 이 남아 있는 .pytest_cache 에서도 경로 충돌(PytestCacheWarning, 캐시 미저장) 이 나지 않는다.
+    key = f"tradingbot/upbit/{market}/{interval}/{count}_to_{to.replace(':', '').replace('-', '')}"
     cached = request.config.cache.get(key, None)
     if cached:
         return cached
@@ -107,26 +109,26 @@ def _cached_real_raw(request, market: str, interval: str, count: int, to: str | 
         raw = fetch_real_upbit_candles(market, interval, count, to=to)
     except Exception as e:  # noqa: BLE001
         pytest.skip(f"실제 시세 데이터를 받을 수 없어 건너뜀 (네트워크 필요): {e}")
-    if to is not None:
-        _check_window(raw, market, interval, count, to)
+    _check_window(raw, market, interval, count, to)
     request.config.cache.set(key, json.loads(json.dumps(raw)))
     return raw
 
 
 @pytest.fixture(scope="session")
 def real_btc_daily_raw(request) -> list[dict]:
-    """KRW-BTC 일봉 최신 200개 원본 응답 (Upbit, 최신→과거)."""
+    """KRW-BTC 일봉 200개 원본 응답 (Upbit, 최신→과거, `REAL_CANDLE_WINDOW_END` 직전 고정 구간)."""
     return _cached_real_raw(request, "KRW-BTC", "1d", 200)
 
 
 @pytest.fixture(scope="session")
 def real_btc_hourly_raw(request) -> list[dict]:
-    """KRW-BTC 시간봉 200개 원본 응답 (Upbit, 최신→과거, `REAL_HOURLY_WINDOW_END` 직전 고정 구간)."""
-    return _cached_real_raw(request, "KRW-BTC", "1h", 200, to=REAL_HOURLY_WINDOW_END)
+    """KRW-BTC 시간봉 200개 원본 응답 (같은 고정 구간)."""
+    return _cached_real_raw(request, "KRW-BTC", "1h", 200)
 
 
 @pytest.fixture(scope="session")
 def real_eth_daily_raw(request) -> list[dict]:
+    """KRW-ETH 일봉 200개 원본 응답 (같은 고정 구간)."""
     return _cached_real_raw(request, "KRW-ETH", "1d", 200)
 
 

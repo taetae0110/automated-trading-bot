@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import pytest
+from freezegun import freeze_time
 
 from tradingbot.data.yfinance_feed import (
     INTRADAY_MAX_DAYS,
@@ -204,10 +205,12 @@ def test_weekly_interval(fake_download: FakeDownload, daily_df: pd.DataFrame) ->
 
 
 def test_daily_end_defaults_to_now(fake_download: FakeDownload, daily_df: pd.DataFrame) -> None:
+    # 시계를 고정해 "지금 + 1일" 계산이 UTC 자정을 넘나들며 흔들리지 않게 한다 (실데이터 구간 이후 시각).
     fake_download.result = as_yf_daily(daily_df)
-    out = load_yfinance("005930.KS", "1d", _ts(daily_df, 150))
+    with freeze_time("2026-10-05 23:59:59+00:00"):
+        out = load_yfinance("005930.KS", "1d", _ts(daily_df, 150))
     pd.testing.assert_frame_equal(out, daily_df.iloc[150:].reset_index(drop=True))
-    assert fake_download.last_kwargs["end"] == (utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
+    assert fake_download.last_kwargs["end"] == "2026-10-06"
 
 
 # ---------------------------------------------------------------------------- 분봉
