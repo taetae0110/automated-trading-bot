@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="tradingbot 자동매매 봇 상태·백테스트·거래내역을 보는 로컬 대시보드">
+  <title>트레이딩 대시보드</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <h1>트레이딩 대시보드</h1>
+      <span class="version" id="app-version" aria-label="버전"></span>
+    </div>
+    <div class="engine-controls">
+      <span class="badge" id="engine-badge" data-state="unknown" aria-live="polite">
+        <span class="dot" aria-hidden="true"></span>
+        <span id="engine-badge-text">상태 확인 중…</span>
+      </span>
+      <button type="button" class="btn btn-primary" id="btn-start" disabled>시작</button>
+      <button type="button" class="btn btn-danger" id="btn-stop" disabled>정지</button>
+      <button type="button" class="btn" id="btn-refresh" aria-label="대시보드 새로고침">새로고침</button>
+      <p class="engine-hint" id="engine-hint"></p>
+    </div>
+  </header>
+
+  <div class="banner" id="offline-banner" hidden role="alert">
+    <span aria-hidden="true">⚠</span>
+    <span id="offline-banner-text">서버와 연결할 수 없습니다. 재시도 중…</span>
+  </div>
+
+  <nav class="tabs" role="tablist" aria-label="화면 선택">
+    <button type="button" role="tab" id="tab-dashboard" aria-selected="true" aria-controls="panel-dashboard" data-tab="dashboard">대시보드</button>
+    <button type="button" role="tab" id="tab-backtest" aria-selected="false" aria-controls="panel-backtest" data-tab="backtest" tabindex="-1">백테스트</button>
+    <button type="button" role="tab" id="tab-trades" aria-selected="false" aria-controls="panel-trades" data-tab="trades" tabindex="-1">거래내역</button>
+    <button type="button" role="tab" id="tab-logs" aria-selected="false" aria-controls="panel-logs" data-tab="logs" tabindex="-1">로그</button>
+    <button type="button" role="tab" id="tab-settings" aria-selected="false" aria-controls="panel-settings" data-tab="settings" tabindex="-1">설정</button>
+  </nav>
+
+  <main>
+    <!-- ======================================================= 대시보드 -->
+    <section id="panel-dashboard" role="tabpanel" aria-labelledby="tab-dashboard" data-panel="dashboard">
+      <div class="status-meta" id="status-meta" aria-label="엔진 정보">
+        <span class="chip">모드 <b data-field="mode">-</b></span>
+        <span class="chip">브로커 <b data-field="broker">-</b></span>
+        <span class="chip">시세 <b data-field="data_source">-</b></span>
+        <span class="chip">전략 <b data-field="strategy">-</b></span>
+        <span class="chip">간격 <b data-field="interval">-</b></span>
+        <span class="chip">심볼 <b data-field="symbols">-</b></span>
+        <span class="chip">시작 <b data-field="started_at">-</b></span>
+      </div>
+
+      <div class="kpis" aria-label="핵심 지표">
+        <div class="kpi"><span class="kpi-label">총 자산</span><span class="kpi-value" data-kpi="equity"><span class="skeleton"></span></span><span class="kpi-sub" data-kpi-sub="equity"></span></div>
+        <div class="kpi"><span class="kpi-label">현금</span><span class="kpi-value" data-kpi="cash"><span class="skeleton"></span></span><span class="kpi-sub" data-kpi-sub="cash"></span></div>
+        <div class="kpi"><span class="kpi-label">당일 손익</span><span class="kpi-value" data-kpi="daily_pnl"><span class="skeleton"></span></span><span class="kpi-sub" data-kpi-sub="daily_pnl"></span></div>
+        <div class="kpi"><span class="kpi-label">보유 포지션 수</span><span class="kpi-value" data-kpi="positions"><span class="skeleton"></span></span><span class="kpi-sub" data-kpi-sub="positions"></span></div>
+        <div class="kpi"><span class="kpi-label">사이클 수</span><span class="kpi-value" data-kpi="cycles"><span class="skeleton"></span></span><span class="kpi-sub" data-kpi-sub="cycles"></span></div>
+        <div class="kpi"><span class="kpi-label">마지막 갱신</span><span class="kpi-value" data-kpi="updated"><span class="skeleton"></span></span><span class="kpi-sub" data-kpi-sub="updated"></span></div>
+      </div>
+
+      <div class="prices" id="price-cards" aria-label="현재가">
+        <div class="price-card"><div class="price-symbol"><span class="skeleton"></span></div><div class="price-value"><span class="skeleton"></span></div></div>
+        <div class="price-card"><div class="price-symbol"><span class="skeleton"></span></div><div class="price-value"><span class="skeleton"></span></div></div>
+      </div>
+
+      <div class="grid-2">
+        <article class="card">
+          <header class="card-head">
+            <h2>캔들 차트</h2>
+            <div class="card-tools">
+              <label>심볼 <select id="candle-symbol" aria-label="차트 심볼"></select></label>
+              <label>간격 <select id="candle-interval" aria-label="차트 간격"></select></label>
+            </div>
+          </header>
+          <div class="chart" id="candle-chart" role="img" aria-label="캔들 차트"></div>
+          <p class="chart-fallback" id="candle-fallback" hidden>차트 라이브러리(Lightweight Charts)를 불러오지 못했습니다. 인터넷 연결을 확인한 뒤 새로고침하세요.</p>
+        </article>
+        <article class="card">
+          <header class="card-head">
+            <h2>자산 추이</h2>
+            <span class="muted" id="equity-range"></span>
+          </header>
+          <div class="chart" id="equity-chart" role="img" aria-label="자산 추이 차트"></div>
+          <p class="chart-fallback" id="equity-fallback" hidden>차트 라이브러리를 불러오지 못해 자산 추이를 표시할 수 없습니다.</p>
+        </article>
+      </div>
+
+      <div class="stack dash-tables">
+        <article class="card">
+          <header class="card-head"><h2>보유 포지션</h2></header>
+          <div class="table-wrap">
+            <table id="positions-table">
+              <thead><tr>
+                <th scope="col">심볼</th><th scope="col" class="num">수량</th><th scope="col" class="num">평균단가</th>
+                <th scope="col" class="num">현재가</th><th scope="col" class="num">평가손익</th><th scope="col" class="num">손익률</th>
+                <th scope="col" class="num">손절가</th><th scope="col" class="num">익절가</th><th scope="col">진입 시각</th><th scope="col">진입 사유</th>
+              </tr></thead>
+              <tbody><tr class="skeleton-row"><td colspan="10"><span class="skeleton"></span></td></tr></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="card">
+          <header class="card-head"><h2>돌파 대기 주문</h2></header>
+          <div class="table-wrap">
+            <table id="pending-table">
+              <thead><tr>
+                <th scope="col">심볼</th><th scope="col" class="num">트리거 가격</th><th scope="col">기준 캔들</th><th scope="col">만료</th><th scope="col">사유</th>
+              </tr></thead>
+              <tbody><tr class="skeleton-row"><td colspan="5"><span class="skeleton"></span></td></tr></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="card">
+          <header class="card-head">
+            <h2>최근 거래</h2>
+            <button type="button" class="btn btn-sm" id="btn-goto-trades">전체 보기</button>
+          </header>
+          <div class="table-wrap">
+            <table id="recent-trades-table" class="trades-table">
+              <thead><tr>
+                <th scope="col">심볼</th><th scope="col">방향</th><th scope="col" class="num">수량</th><th scope="col" class="num">진입가</th>
+                <th scope="col" class="num">청산가</th><th scope="col" class="num">손익</th><th scope="col" class="num">손익률</th>
+                <th scope="col" class="num">수수료</th><th scope="col">진입</th><th scope="col">청산</th><th scope="col">사유</th>
+              </tr></thead>
+              <tbody><tr class="skeleton-row"><td colspan="11"><span class="skeleton"></span></td></tr></tbody>
+            </table>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <!-- ======================================================= 백테스트 -->
+    <section id="panel-backtest" role="tabpanel" aria-labelledby="tab-backtest" data-panel="backtest" hidden>
+      <form id="bt-form" class="card" novalidate>
+        <header class="card-head"><h2>백테스트 설정</h2></header>
+        <div class="form-grid">
+          <label>전략
+            <select id="bt-strategy" name="strategy" required></select>
+          </label>
+          <label>심볼 (쉼표로 구분)
+            <input id="bt-symbols" name="symbols" type="text" autocomplete="off" placeholder="KRW-BTC, KRW-ETH" required>
+          </label>
+          <label>캔들 간격
+            <select id="bt-interval" name="interval"></select>
+          </label>
+          <label>시작일
+            <input id="bt-start" name="start" type="date">
+          </label>
+          <label>종료일
+            <input id="bt-end" name="end" type="date">
+          </label>
+          <label>초기 자금
+            <input id="bt-cash" name="initial_cash" type="number" min="0" step="any" inputmode="decimal">
+          </label>
+          <label>데이터 출처
+            <select id="bt-source" name="source">
+              <option value="auto">자동 (CSV 캐시 → 브로커)</option>
+              <option value="csv">CSV 캐시만</option>
+              <option value="broker">브로커에서 내려받기</option>
+              <option value="yfinance">yfinance</option>
+            </select>
+          </label>
+        </div>
+        <fieldset>
+          <legend>전략 파라미터</legend>
+          <div class="form-grid" id="bt-params"></div>
+          <p class="strategy-desc" id="bt-strategy-desc"></p>
+        </fieldset>
+        <div class="form-actions">
+          <button type="submit" class="btn btn-primary" id="bt-run">백테스트 실행</button>
+          <span id="bt-status" role="status" aria-live="polite" class="muted"></span>
+        </div>
+      </form>
+
+      <div class="bt-layout">
+        <div class="stack" id="bt-result" hidden>
+          <article class="card">
+            <header class="card-head"><h2>결과 지표</h2><span class="muted" id="bt-result-title"></span></header>
+            <div class="bt-head" id="bt-result-head"></div>
+            <dl class="metrics" id="bt-metrics"></dl>
+          </article>
+          <article class="card">
+            <header class="card-head"><h2>자산 곡선</h2></header>
+            <div class="chart chart-sm" id="bt-equity-chart" role="img" aria-label="백테스트 자산 곡선"></div>
+            <p class="chart-fallback" id="bt-equity-fallback" hidden>차트 라이브러리를 불러오지 못해 자산 곡선을 표시할 수 없습니다.</p>
+          </article>
+          <article class="card">
+            <header class="card-head"><h2>거래 목록</h2><span class="muted" id="bt-trades-count"></span></header>
+            <div class="table-wrap">
+              <table id="bt-trades-table" class="trades-table">
+                <thead><tr>
+                  <th scope="col">심볼</th><th scope="col">방향</th><th scope="col" class="num">수량</th><th scope="col" class="num">진입가</th>
+                  <th scope="col" class="num">청산가</th><th scope="col" class="num">손익</th><th scope="col" class="num">손익률</th>
+                  <th scope="col" class="num">수수료</th><th scope="col">진입</th><th scope="col">청산</th><th scope="col">사유</th>
+                </tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </article>
+          <article class="card">
+            <header class="card-head"><h2>요약</h2></header>
+            <pre class="wrap" id="bt-summary"></pre>
+          </article>
+        </div>
+        <aside class="card">
+          <header class="card-head"><h2>이전 작업</h2><button type="button" class="btn btn-sm" id="bt-jobs-refresh">새로고침</button></header>
+          <ul class="job-list" id="bt-jobs"></ul>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ======================================================= 거래내역 -->
+    <section id="panel-trades" role="tabpanel" aria-labelledby="tab-trades" data-panel="trades" hidden>
+      <article class="card">
+        <header class="card-head">
+          <h2>거래내역 <span class="muted" id="trades-total"></span></h2>
+          <div class="card-tools">
+            <label>표시 건수
+              <select id="trades-limit" aria-label="표시 건수">
+                <option value="100">100</option><option value="300">300</option><option value="1000">1000</option>
+              </select>
+            </label>
+            <button type="button" class="btn btn-sm" id="trades-refresh">새로고침</button>
+          </div>
+        </header>
+        <div class="table-wrap">
+          <table id="trades-table" class="trades-table">
+            <thead><tr>
+              <th scope="col">심볼</th><th scope="col">방향</th><th scope="col" class="num">수량</th><th scope="col" class="num">진입가</th>
+              <th scope="col" class="num">청산가</th><th scope="col" class="num">손익</th><th scope="col" class="num">손익률</th>
+              <th scope="col" class="num">수수료</th><th scope="col">진입</th><th scope="col">청산</th><th scope="col">사유</th>
+            </tr></thead>
+            <tbody><tr class="skeleton-row"><td colspan="11"><span class="skeleton"></span></td></tr></tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <!-- ======================================================= 로그 -->
+    <section id="panel-logs" role="tabpanel" aria-labelledby="tab-logs" data-panel="logs" hidden>
+      <article class="card">
+        <header class="card-head">
+          <h2>로그 <code id="log-file" class="muted"></code></h2>
+          <div class="card-tools">
+            <label>줄 수
+              <select id="log-lines" aria-label="로그 줄 수">
+                <option value="100">100</option><option value="200" selected>200</option><option value="500">500</option><option value="1000">1000</option>
+              </select>
+            </label>
+            <label class="check"><input type="checkbox" id="log-auto" checked> 자동 갱신 (5초)</label>
+            <button type="button" class="btn btn-sm" id="log-refresh">새로고침</button>
+          </div>
+        </header>
+        <pre id="log-output" aria-live="off" tabindex="0">불러오는 중…</pre>
+      </article>
+    </section>
+
+    <!-- ======================================================= 설정 -->
+    <section id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" data-panel="settings" hidden>
+      <article class="card">
+        <header class="card-head"><h2>설정 (읽기 전용)</h2></header>
+        <p class="muted">설정 파일: <code id="config-path">-</code></p>
+        <p class="muted">API 키 등 비밀값은 설정에 포함되지 않습니다 (.env 에서만 읽습니다). 변경하려면 설정 파일을 수정한 뒤 서버를 다시 시작하세요.</p>
+        <pre id="config-dump" tabindex="0">불러오는 중…</pre>
+      </article>
+    </section>
+  </main>
+</div>
+
+<dialog id="confirm-dialog" class="dialog" aria-labelledby="confirm-title">
+  <form method="dialog">
+    <h2 id="confirm-title">확인</h2>
+    <p id="confirm-text"></p>
+    <div class="form-actions">
+      <button type="submit" class="btn" value="cancel">취소</button>
+      <button type="submit" class="btn btn-danger" value="ok" id="confirm-ok">확인</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toasts" id="toasts" popover="manual" aria-live="polite"></div>
+</body>
+</html>
