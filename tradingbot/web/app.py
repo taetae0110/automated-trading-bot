@@ -245,7 +245,9 @@ def create_app(
         has_body = request.headers.get("content-length", "0") not in ("", "0") or bool(
             request.headers.get("transfer-encoding")
         )
-        if has_body and not (request.headers.get("content-type") or "").lower().startswith("application/json"):
+        if has_body and not (request.headers.get("content-type") or "").lower().startswith(
+            "application/json"
+        ):
             raise WebError(415, "요청 본문은 application/json 이어야 합니다")
 
     mutation = [Depends(_mutation_guard)]

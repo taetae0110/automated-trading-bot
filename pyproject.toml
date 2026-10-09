@@ -40,6 +40,9 @@ tradingbot = "tradingbot.cli:app"
 [tool.setuptools.packages.find]
 include = ["tradingbot*"]
 
+[tool.setuptools.package-data]
+tradingbot = ["web/static/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

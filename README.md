@@ -91,6 +91,7 @@ tradingbot balance -c config/config.yaml --live  # 실제 계좌 조회
 | `tradingbot run -c CFG [--live] [--once] [--yes]` | 매매 엔진. 기본 모의투자. `--live` 는 `mode: live` 일 때만 |
 | `tradingbot balance -c CFG [--live]` | paper: 저장된 모의 계좌 / `--live` 또는 `mode: live`: 실제 계좌 |
 | `tradingbot status -c CFG` | 상태 파일 요약 (포지션, 돌파 대기, 최근 거래, 당일 손익) |
+| `tradingbot web -c CFG [--host 127.0.0.1] [--port 8080] [--no-open]` | 로컬 웹 대시보드 (아래 참고) |
 | 전역 `--debug` | 오류 시 트레이스백 + DEBUG 로그 (기본은 한국어 한 줄 오류 + 종료 코드 1) |
 
 `-p/--param` 값은 `true/false` → bool, 정수 → int, 실수 → float, 그 외 → 문자열로 해석됩니다.
@@ -205,6 +206,22 @@ tradingbot balance -c config/config.yaml --live  # 실제 계좌 조회
 
 `--report` 를 주면 `reports/` 에 JSON(전체 결과·자산곡선·거래), `_equity.csv`, `_summary.txt` 가 저장됩니다.
 체결 모델과 지표 정의는 [docs/BACKTEST.md](docs/BACKTEST.md) 를 참고하세요.
+
+## 웹 대시보드
+
+```bash
+pip install -e '.[web]'            # fastapi + uvicorn (.[all] 에 포함)
+tradingbot web -c config/config.yaml   # http://127.0.0.1:8080 이 브라우저에서 열립니다
+```
+
+- **대시보드**: 엔진 상태(실행 중·정지), 총 자산 / 현금 / 당일 손익 / 보유 종목 수, 종목별 현재가, 캔들 차트(심볼·간격 선택), 자산 추이, 보유 포지션, 돌파 대기 주문, 최근 거래
+- **백테스트**: 전략·파라미터·종목·기간·초기 자금을 폼에서 고르고 실행 → 성과 지표, 자산 곡선, 거래 목록, 요약 (이전 작업 목록 유지)
+- **거래내역 / 로그 / 설정**: 청산된 거래 전체, `logs/tradingbot.log` 실시간 tail, 현재 설정(읽기 전용)
+- 모의투자 엔진은 웹의 **시작/정지** 버튼으로 켜고 끌 수 있습니다. 터미널의 `tradingbot run` 이 같은 상태 파일을 쓰고 있으면 "실행 중 · 외부 프로세스" 로 표시되고 웹에서는 제어하지 않습니다.
+- **실거래(`mode: live`)는 웹에서 시작할 수 없습니다.** 터미널에서 `tradingbot run --live` 로만 시작됩니다.
+- 대시보드에는 인증이 없으므로 `--host 0.0.0.0` 등으로 외부에 노출하지 마세요 (경고 로그가 출력됩니다). 같은 출처(same-origin) 검사와 요청 토큰으로 브라우저 교차 사이트 요청은 차단됩니다.
+- 자산 추이는 상태 파일 옆 `data/equity_history.jsonl` 에 60초당 최대 1점씩 기록됩니다 (최근 10,000줄 유지).
+- 모든 시세와 백테스트 데이터는 실제 거래소에서 받습니다. 샘플 데이터는 없습니다.
 
 ## 상태 · 로그 · 알림
 

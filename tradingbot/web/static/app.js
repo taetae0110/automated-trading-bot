@@ -37,7 +37,7 @@
   const state = {
     config: null, configPath: null, strategies: [], status: null, quote: "KRW",
     tab: "dashboard", prices: {}, prevPrices: {}, candleKey: "", refreshing: false,
-    engineBusy: false, logTimer: null, lastToasts: new Map(), lastEngineError: null,
+    engineBusy: false, logTimer: null, lastToasts: new Map(), lastEngineError: null, stopPending: false,
     bt: { jobId: null, timer: null, current: null },
   };
 
@@ -145,12 +145,17 @@
   class ApiError extends Error {
     constructor(message, status, data) { super(message); this.status = status; this.data = data; }
   }
+  // 서버가 index.html 에 넣어 준 프로세스별 토큰 — 모든 /api 요청에 실어 보낸다 (POST 는 이 헤더가 없으면 403)
+  const tokenMeta = document.querySelector('meta[name="dashboard-token"]');
+  const DASHBOARD_TOKEN = tokenMeta ? tokenMeta.content : "";
   async function api(path, { method = "GET", body } = {}) {
     let res;
     try {
+      const headers = { Accept: "application/json", "X-Dashboard-Token": DASHBOARD_TOKEN };
+      if (body !== undefined) headers["Content-Type"] = "application/json";
       res = await fetch(path, {
         method,
-        headers: body !== undefined ? { "Content-Type": "application/json", Accept: "application/json" } : { Accept: "application/json" },
+        headers,
         body: body !== undefined ? JSON.stringify(body) : undefined,
         cache: "no-store",
       });
@@ -304,7 +309,8 @@
         show(inst.container, true);
         if (inst.fallback) show(inst.fallback, false);
         if (inst.credit) show(inst.credit, true);
-        inst.chart = LW.createChart(inst.container, { width: inst.container.clientWidth || 300, height: inst.container.clientHeight || 300 });
+        // attributionLogo 는 생성 시점에 꺼야 한다: 켜진 채 만들면 라이브러리가 인라인 <style> 을 넣어 CSP(style-src) 위반이 난다. 출처는 .chart-credit 텍스트 링크로 표기
+        inst.chart = LW.createChart(inst.container, { width: inst.container.clientWidth || 300, height: inst.container.clientHeight || 300, layout: { attributionLogo: false } });
         if (inst.kind === "candle") {
           inst.series = inst.chart.addCandlestickSeries({});
           inst.volume = inst.chart.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "vol", lastValueVisible: false, priceLineVisible: false });
@@ -491,6 +497,8 @@
     }
     const crashed = Boolean(engineError) && payload.source !== "engine";
     const mode = payload.source === "engine" ? "internal" : payload.external_running ? "external" : crashed ? "crashed" : "stopped";
+    if (payload.stop_pending) state.stopPending = true;
+    if (mode !== "internal") state.stopPending = false;
     const badge = $("#engine-badge");
     badge.dataset.state = mode === "crashed" ? "error" : mode;
     $("#engine-badge-text").textContent = { internal: "실행 중 · 내부", external: "실행 중 · 외부 프로세스", crashed: "정지 · 오류 종료" }[mode] || "정지";
@@ -499,7 +507,7 @@
     const stop = $("#btn-stop");
     let hint = "";
     if (mode === "external") { hint = "다른 프로세스(터미널의 tradingbot run)가 상태 파일을 사용 중이라 여기서는 제어할 수 없습니다."; start.disabled = true; stop.disabled = true; }
-    else if (mode === "internal") { start.disabled = true; stop.disabled = false; hint = payload.stop_pending ? "정지 요청을 보냈습니다. 엔진이 종료되는 중입니다…" : "이 웹 서버 안에서 모의투자 엔진이 실행 중입니다."; }
+    else if (mode === "internal") { start.disabled = true; stop.disabled = false; hint = state.stopPending ? "정지 요청을 보냈습니다. 엔진이 종료되는 중입니다… (다음 갱신에서 반영)" : "이 웹 서버 안에서 모의투자 엔진이 실행 중입니다."; }
     else if (mode === "crashed") { start.disabled = isLive; stop.disabled = true; hint = `엔진이 오류로 종료되었습니다: ${engineError}${isLive ? "" : " — 원인을 확인한 뒤 시작으로 다시 실행할 수 있습니다."}`; }
     else { start.disabled = isLive; stop.disabled = true; if (isLive) hint = LIVE_MSG; else if (payload.source === "state_file") hint = "저장된 상태 파일만 있습니다. 시작을 누르면 모의투자 엔진을 이 서버에서 실행합니다."; }
     if (mode === "external" && engineError) hint += ` (이전 내부 엔진 오류: ${engineError})`;

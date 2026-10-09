@@ -3,21 +3,30 @@
 시세는 전부 tests/conftest.py 가 Upbit 공개 API 에서 받아 캐시한 **실제** KRW-BTC 캔들(1h, 1d) 이다 (네트워크 없으면 skip).
 ``FeedBroker`` 는 그 실제 캔들을 서빙하는 시세 전용 브로커이며 ``tradingbot.web.service.create_broker`` 자리에
 monkeypatch 된다. 가짜/데모 가격은 없다 — 계좌 설정값(초기 현금, 수수료율)만 상수다.
+
+보안 계약: 상태 변경(POST) 요청은 프로세스별 토큰(``X-Dashboard-Token``) 이 있어야 하고 cross-site 요청은 거부된다.
+Host 헤더는 바인드 주소에 맞는 것만 허용된다 (DNS 리바인딩 차단). 테스트 클라이언트는 ``make_client`` 로 만든다.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
+import socket
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
@@ -30,6 +39,7 @@ from tradingbot.data import CandleStore
 from tradingbot.engine.state import StateStore
 from tradingbot.engine.trader import Trader
 from tradingbot.exceptions import AuthenticationError, BrokerError
+from tradingbot.logging_setup import FILE_HANDLER_NAME, teardown_logging
 from tradingbot.models import (
     AssetClass,
     Candle,
@@ -42,11 +52,14 @@ from tradingbot.models import (
 )
 from tradingbot.risk import RiskManager
 from tradingbot.strategies.base import BaseStrategy
+from tradingbot.web import jobs as web_jobs
 from tradingbot.web import service as web_service
-from tradingbot.web.app import create_app
+from tradingbot.web.app import MAX_BODY_BYTES, TOKEN_HEADER, TOKEN_PLACEHOLDER, create_app, host_allowed
+from tradingbot.web.jobs import BacktestJobRunner
 from tradingbot.web.service import (
     EQUITY_HISTORY_FILE,
     LIVE_START_MESSAGE,
+    STATE_UNREADABLE_MESSAGE,
     DashboardService,
     is_loopback_host,
     mask_log_line,
@@ -54,10 +67,13 @@ from tradingbot.web.service import (
 )
 
 BTC = "KRW-BTC"
+ETH = "KRW-ETH"
 INITIAL_CASH = 10_000_000.0
 FEE = 0.0005
 SLIP = 0.0005
 H = 3600
+#: 테스트 클라이언트의 주소 (Host 검사: 루프백만 허용)
+BASE_URL = "http://127.0.0.1:8080"
 
 SECRET_KEY_RE = re.compile(r"(?i)key|secret|token|password|webhook")
 
@@ -112,8 +128,7 @@ class FeedBroker(BaseBroker):
             out = [c for c in out if c.timestamp < ensure_utc(end)]
         return out[-limit:]
 
-    def get_ticker(self, symbol):
-        self.calls["get_ticker"] += 1
+    def _price_of(self, symbol: str) -> float:
         now = self._clock()
         newest: Candle | None = None
         for (sym, interval), series in self._candles.items():
@@ -129,6 +144,10 @@ class FeedBroker(BaseBroker):
         if newest is None:
             raise BrokerError(f"feed 에 없는 심볼: {symbol}")
         return float(newest.close)
+
+    def get_ticker(self, symbol):
+        self.calls["get_ticker"] += 1
+        return self._price_of(symbol)
 
     def get_balances(self):
         return {}
@@ -159,6 +178,20 @@ class FeedBroker(BaseBroker):
 
     def close(self):
         self.closed = True
+
+
+class BatchFeedBroker(FeedBroker):
+    """Upbit 처럼 ``get_tickers`` (여러 마켓을 한 요청에) 를 지원하는 피드."""
+
+    def get_tickers(self, symbols: list[str]) -> dict[str, float]:
+        self.calls["get_tickers"] += 1
+        out: dict[str, float] = {}
+        for sym in symbols:
+            try:
+                out[sym] = self._price_of(sym)
+            except BrokerError:
+                continue  # Upbit 는 모르는 마켓을 응답에서 뺀다
+        return out
 
 
 class QueuedStrategy(BaseStrategy):
@@ -238,6 +271,14 @@ def _merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def make_client(app: Any, *, token: bool = True, **kw: Any) -> TestClient:
+    """루프백 Host + (기본) 프로세스 토큰 헤더를 가진 테스트 클라이언트."""
+    headers: dict[str, str] = dict(kw.pop("headers", {}) or {})
+    if token:
+        headers.setdefault(TOKEN_HEADER, app.state.dashboard_token)
+    return TestClient(app, base_url=BASE_URL, headers=headers, **kw)
+
+
 def complete_candles(candles: list[Candle], interval: str) -> list[Candle]:
     """실제 시각 기준으로 완성된 캔들만 (Upbit 응답에는 진행중 캔들이 포함될 수 있다)."""
     step = timedelta(seconds=interval_to_seconds(interval))
@@ -312,11 +353,17 @@ def wait_until(predicate: Callable[[], bool], timeout: float = 10.0) -> bool:
     return predicate()
 
 
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
 # ============================================================================ 픽스처
 @pytest.fixture(autouse=True)
 def _isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """저장소의 .env 와 실제 키가 테스트에 섞이지 않게 한다."""
-    for name in list(__import__("os").environ):
+    for name in list(os.environ):
         if any(
             tag in name
             for tag in (
@@ -360,7 +407,7 @@ def config(tmp_path: Path) -> AppConfig:
 @pytest.fixture
 def client(config: AppConfig, feed_factory: Any, tmp_path: Path) -> Iterator[TestClient]:
     app = create_app(config, config_path=tmp_path / "config.yaml")
-    with TestClient(app) as c:
+    with make_client(app) as c:
         yield c
 
 
@@ -416,13 +463,126 @@ class TestBasics:
         assert r.status_code == 404
         assert "error" in r.json()
 
-    def test_index_serves_static_or_503(self, client: TestClient) -> None:
+    def test_index_injects_process_token(self, client: TestClient) -> None:
         r = client.get("/")
-        assert r.status_code in (200, 503)
-        if r.status_code == 503:
-            assert "error" in r.json()
-        else:
-            assert "<html" in r.text.lower()
+        assert r.status_code == 200
+        assert "<html" in r.text.lower()
+        token = client.app.state.dashboard_token
+        assert f'name="dashboard-token" content="{token}"' in r.text
+        assert TOKEN_PLACEHOLDER not in r.text
+        assert r.headers["cache-control"] == "no-store"
+
+
+# ============================================================================ 보안: Host / CSRF / 오류 노출
+class TestSecurity:
+    def test_host_allowed_policy(self) -> None:
+        # 루프백 바인드: 루프백 이름만
+        for h in ("127.0.0.1:8080", "localhost", "LOCALHOST:8080", "[::1]:8080", "127.5.5.5"):
+            assert host_allowed(h, "127.0.0.1"), h
+        for h in ("attacker.example.com", "evil.test:8080", "192.168.0.5:8080", "", None):
+            assert not host_allowed(h, "127.0.0.1"), h
+        # LAN 노출(0.0.0.0): IP 리터럴은 허용, DNS 이름은 거부 (리바인딩), 추가 허용 이름은 통과
+        assert host_allowed("192.168.0.5:8080", "0.0.0.0")
+        assert host_allowed("[fe80::1]:8080", "::")
+        assert not host_allowed("mybox.local:8080", "0.0.0.0")
+        assert host_allowed("mybox.local:8080", "0.0.0.0", extra=("mybox.local",))
+        # 특정 호스트명에 바인드하면 그 이름만
+        assert host_allowed("mybox.local:8080", "mybox.local")
+        assert not host_allowed("other.local:8080", "mybox.local")
+
+    def test_rebinding_host_header_is_rejected(self, client: TestClient) -> None:
+        for host in ("attacker.example.com", "evil.test:8080", "testserver"):
+            for path in ("/", "/api/config", "/api/trades"):
+                r = client.get(path, headers={"Host": host})
+                assert r.status_code == 400, (host, path, r.text)
+                assert "Host" in r.json()["error"]
+        for host in ("localhost:9", "[::1]:8080", "127.0.0.1"):
+            assert client.get("/api/health", headers={"Host": host}).status_code == 200
+
+    def test_bind_host_widens_allowed_hosts(self, tmp_path: Path, feed_factory: Any) -> None:
+        cfg = make_config(tmp_path)
+        app = create_app(cfg, bind_host="0.0.0.0")
+        with make_client(app) as c:
+            assert c.get("/api/health", headers={"Host": "192.168.0.5:8080"}).status_code == 200
+            assert c.get("/api/health", headers={"Host": "mybox.local"}).status_code == 400
+        app = create_app(cfg, bind_host="127.0.0.1", allowed_hosts=["mybox.local"])
+        with make_client(app) as c:
+            assert c.get("/api/health", headers={"Host": "mybox.local:8080"}).status_code == 200
+            assert c.get("/api/health", headers={"Host": "192.168.0.5:8080"}).status_code == 400
+
+    def test_post_requires_process_token(self, config: AppConfig, feed_factory: Any) -> None:
+        app = create_app(config)
+        with make_client(app, token=False) as c:
+            # 읽기는 토큰 없이 가능
+            assert c.get("/api/status").status_code == 200
+            for path in ("/api/engine/start", "/api/engine/stop", "/api/backtest"):
+                r = c.post(path, json={})
+                assert r.status_code == 403, (path, r.text)
+                assert "토큰" in r.json()["error"]
+            r = c.post("/api/engine/start", headers={TOKEN_HEADER: "wrong-token"})
+            assert r.status_code == 403
+            assert c.get("/api/backtest").json()["jobs"] == []
+            assert c.get("/api/status").json()["source"] == "none"  # 엔진이 시작되지 않았다
+
+    def test_cross_site_requests_are_rejected_even_with_token(self, client: TestClient) -> None:
+        # 브라우저 '단순 요청' (폼 POST / no-cors fetch) 모양: 토큰이 있어도 cross-site 면 거부
+        cross = {
+            "Origin": "https://evil.example",
+            "Sec-Fetch-Site": "cross-site",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        for path in ("/api/engine/start", "/api/engine/stop", "/api/backtest"):
+            r = client.post(path, content=b"symbols=KRW-BTC", headers=cross)
+            assert r.status_code == 403, (path, r.text)
+            assert "cross-site" in r.json()["error"] or "출처" in r.json()["error"]
+        # Origin 만 다른 경우
+        r = client.post("/api/engine/start", headers={"Origin": "http://evil.test"})
+        assert r.status_code == 403 and "Origin" in r.json()["error"]
+        # 같은 출처는 통과 (엔진이 없으므로 stop 은 409)
+        r = client.post("/api/engine/stop", headers={"Origin": BASE_URL, "Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 409
+        # 본문이 있는 POST 는 application/json 만
+        r = client.post(
+            "/api/backtest",
+            content=b'{"symbols": ["KRW-BTC"], "source": "csv", "interval": "1d"}',
+            headers={"Content-Type": "text/plain"},
+        )
+        assert r.status_code == 415
+        assert client.get("/api/backtest").json()["jobs"] == []
+        assert client.get("/api/status").json()["source"] == "none"
+
+    def test_backtest_body_size_limit(self, client: TestClient) -> None:
+        big = {"symbols": [BTC], "source": "csv", "params": {"junk": "x" * (MAX_BODY_BYTES + 10)}}
+        r = client.post("/api/backtest", json=big)
+        assert r.status_code == 413 and "본문" in r.json()["error"]
+        assert client.get("/api/backtest").json()["jobs"] == []
+
+    def test_unhandled_error_is_generic(self, config: AppConfig, feed_factory: Any) -> None:
+        app = create_app(config)
+        service: DashboardService = app.state.service
+
+        def boom() -> dict[str, Any]:
+            raise RuntimeError("boom: /home/user/secret/state.json <internal detail>")
+
+        service.health = boom  # type: ignore[method-assign]
+        with make_client(app, raise_server_exceptions=False) as c:
+            r = c.get("/api/health")
+            assert r.status_code == 500
+            body = r.json()
+            assert "서버 내부 오류" in body["error"]
+            assert "secret" not in body["error"] and "RuntimeError" not in body["error"]
+
+    def test_responses_do_not_expose_filesystem_paths(
+        self, client: TestClient, traded_config: AppConfig, tmp_path: Path
+    ) -> None:
+        client.get("/api/status")
+        eq = client.get("/api/equity").json()
+        assert eq["file"] == EQUITY_HISTORY_FILE
+        log = Path(traded_config.logging.file)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("줄\n", encoding="utf-8")
+        lg = client.get("/api/logs").json()
+        assert lg["file"] == log.name and str(tmp_path) not in json.dumps(lg)
 
 
 # ============================================================================ 상태: none → state_file → engine
@@ -480,6 +640,29 @@ class TestStatus:
         body = client.get("/api/status").json()
         assert body["external_running"] is False and body["status"]["running"] is False
 
+    def test_corrupt_state_file_is_reported_not_quarantined(
+        self, client: TestClient, traded_config: AppConfig
+    ) -> None:
+        """읽기 전용 관찰자: 손상된(또는 저장 중인) 상태 파일을 옮기거나 지우지 않고 503 으로 알린다."""
+        path = Path(traded_config.engine.state_file)
+        good = path.read_text(encoding="utf-8")
+        truncated = good[: len(good) // 2]
+        path.write_text(truncated, encoding="utf-8")
+        before = sorted(p.name for p in path.parent.iterdir())
+        for api in ("/api/status", "/api/positions", "/api/trades"):
+            r = client.get(api)
+            assert r.status_code == 503, (api, r.text)
+            assert r.json()["error"] == STATE_UNREADABLE_MESSAGE
+        assert sorted(p.name for p in path.parent.iterdir()) == before
+        assert path.read_text(encoding="utf-8") == truncated
+        # 방금 갱신된(읽을 수 없는) 파일 = 다른 프로세스가 저장 중일 수 있음 → 시작 거부
+        r = client.post("/api/engine/start")
+        assert r.status_code == 409 and "다른 프로세스" in r.json()["error"]
+        assert path.read_text(encoding="utf-8") == truncated
+        # 복구되면 바로 정상
+        path.write_text(good, encoding="utf-8")
+        assert client.get("/api/status").json()["source"] == "state_file"
+
     def test_engine_start_stop_lifecycle(self, client: TestClient, config: AppConfig) -> None:
         assert client.get("/api/status").json()["source"] == "none"
         r = client.post("/api/engine/start")
@@ -518,9 +701,55 @@ class TestStatus:
         assert r.json()["source"] == "engine"
         assert client.post("/api/engine/stop").status_code == 200
 
+    def test_stop_issued_before_loop_starts_is_not_lost(
+        self, tmp_path: Path, feed_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``run_forever`` 는 시작하면서 stop 이벤트를 지운다. 그 전에 온 정지 요청도 유실되지 않아야 한다."""
+        original = Trader.run_forever
+
+        def delayed_run_forever(self: Trader) -> None:
+            time.sleep(0.3)  # 스레드가 루프에 들어가기 전에 stop() 이 먼저 도착하게
+            original(self)
+
+        monkeypatch.setattr(Trader, "run_forever", delayed_run_forever)
+        svc = DashboardService(make_config(tmp_path))
+        try:
+            assert svc.start_engine()["source"] == "engine"
+            t0 = time.monotonic()
+            payload = svc.stop_engine()
+            elapsed = time.monotonic() - t0
+            assert "stop_pending" not in payload, payload
+            assert elapsed < 10, elapsed
+            assert not svc.engine_alive()
+        finally:
+            svc.close()
+
+    def test_status_retries_when_engine_mutates_dicts(self, client: TestClient) -> None:
+        assert client.post("/api/engine/start").status_code == 200
+        service: DashboardService = client.app.state.service
+        trader = service._trader
+        assert trader is not None
+        real_status = trader.status
+        calls = {"n": 0}
+
+        def flaky_status() -> dict[str, Any]:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("dictionary changed size during iteration")
+            return real_status()
+
+        trader.status = flaky_status  # type: ignore[method-assign]
+        try:
+            r = client.get("/api/status")
+            assert r.status_code == 200 and r.json()["source"] == "engine"
+            assert calls["n"] == 2
+        finally:
+            trader.status = real_status  # type: ignore[method-assign]
+            assert client.post("/api/engine/stop").status_code == 200
+
     def test_start_409_when_live_config(self, tmp_path: Path, feed_factory: Any) -> None:
         cfg = make_config(tmp_path, mode="live")
-        with TestClient(create_app(cfg)) as c:
+        with make_client(create_app(cfg)) as c:
             r = c.post("/api/engine/start")
             assert r.status_code == 409
             assert r.json()["error"] == LIVE_START_MESSAGE
@@ -536,11 +765,33 @@ class TestStatus:
 
     def test_start_400_when_broker_is_paper(self, tmp_path: Path, feed_factory: Any) -> None:
         cfg = make_config(tmp_path, broker={"name": "paper"})
-        with TestClient(create_app(cfg)) as c:
+        with make_client(create_app(cfg)) as c:
             r = c.post("/api/engine/start")
             assert r.status_code == 400 and "paper" in r.json()["error"]
             r = c.get("/api/candles")
             assert r.status_code == 400
+
+    def test_engine_log_file_attached_only_while_engine_runs(self, tmp_path: Path, feed_factory: Any) -> None:
+        """대시보드 프로세스는 엔진을 돌리는 동안만 로그 파일 핸들러를 붙인다 (외부 run 프로세스의 회전 파일을 공유하지 않게)."""
+        cfg = make_config(tmp_path)
+        root = logging.getLogger()
+
+        def file_handlers() -> list[logging.Handler]:
+            return [h for h in root.handlers if h.get_name() == FILE_HANDLER_NAME]
+
+        svc = DashboardService(cfg, engine_log_file=True)
+        try:
+            assert file_handlers() == []
+            svc.start_engine()
+            handlers = file_handlers()
+            assert len(handlers) == 1
+            assert Path(getattr(handlers[0], "baseFilename", "")) == Path(cfg.logging.file).resolve()
+            svc.stop_engine()
+            assert wait_until(lambda: file_handlers() == [], timeout=5)
+            assert "웹 대시보드에서 모의투자 엔진 시작" in Path(cfg.logging.file).read_text(encoding="utf-8")
+        finally:
+            svc.close()
+            teardown_logging()
 
 
 # ============================================================================ 포지션 / 거래 / 시세 / 캔들
@@ -617,6 +868,24 @@ class TestMarketData:
         client.get("/api/prices")  # 5초 캐시 → 브로커 재호출 없음
         assert feeds[0].calls["get_ticker"] == calls
 
+    def test_prices_use_single_batch_call_when_supported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, candles: list[Candle]
+    ) -> None:
+        """브로커가 get_tickers 를 지원하면 심볼 수와 무관하게 한 번만 호출한다 (피드에 없는 심볼은 errors 로)."""
+        feed = BatchFeedBroker({(BTC, "1h"): candles})
+        monkeypatch.setattr(web_service, "create_broker", lambda name, config: feed)
+        cfg = make_config(tmp_path, symbols=[BTC, ETH])
+        svc = DashboardService(cfg)
+        try:
+            body = svc.prices()
+            assert body["prices"] == {BTC: pytest.approx(candles[-1].close)}
+            assert ETH in body["errors"] and "없습니다" in body["errors"][ETH]
+            assert feed.calls["get_tickers"] == 1 and feed.calls["get_ticker"] == 0
+            svc.prices()  # 캐시 → 호출 없음 (ETH 는 캐시에 없어 다시 한 번 일괄 조회)
+            assert feed.calls["get_tickers"] == 2 and feed.calls["get_ticker"] == 0
+        finally:
+            svc.close()
+
     def test_candles_shape_and_defaults(
         self, client: TestClient, candles: list[Candle], daily_candles
     ) -> None:
@@ -660,6 +929,47 @@ class TestMarketData:
         assert r.status_code == 400, r.text
         assert r.json()["error"]
 
+    def test_slow_request_does_not_block_other_requests(
+        self, config: AppConfig, feed_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """라우트는 스레드풀에서 돈다: 느린 브로커 호출이 /api/health 를 막지 않는다 (실제 uvicorn 서버)."""
+        uvicorn = pytest.importorskip("uvicorn")
+        app = create_app(config, bind_host="127.0.0.1")
+        service: DashboardService = app.state.service
+        real = service.strategies
+
+        def slow_strategies() -> dict[str, Any]:
+            time.sleep(1.5)
+            return real()
+
+        service.strategies = slow_strategies  # type: ignore[method-assign]
+        port = free_port()
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app, host="127.0.0.1", port=port, log_config=None, access_log=False, log_level="warning"
+            )
+        )
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        try:
+            assert wait_until(lambda: server.started, timeout=15)
+            base = f"http://127.0.0.1:{port}"
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                slow = pool.submit(lambda: httpx.get(f"{base}/api/strategies", timeout=10))
+                time.sleep(0.2)
+                t0 = time.monotonic()
+                fast = httpx.get(f"{base}/api/health", timeout=10)
+                fast_elapsed = time.monotonic() - t0
+                assert fast.status_code == 200 and fast.json()["ok"] is True
+                assert fast_elapsed < 1.0, fast_elapsed
+                assert slow.result().status_code == 200
+            # Host 검사는 실제 서버에서도 동작한다
+            r = httpx.get(f"{base}/api/health", headers={"Host": "attacker.example.com"}, timeout=10)
+            assert r.status_code == 400
+        finally:
+            server.should_exit = True
+            thread.join(10)
+
 
 # ============================================================================ 자산 이력
 class TestEquity:
@@ -694,12 +1004,12 @@ class TestEquity:
         assert svc.sample_equity(None, t0 + timedelta(seconds=200)) is False
         points = svc.equity_history(10)["points"]
         assert [p["equity"] for p in points] == [100.0, 102.0]
-        # 상한 초과 시 최근 EQUITY_MAX_LINES 줄만 남긴다
-        svc._equity_lines = web_service.EQUITY_TRIM_AT
+        # 상한 초과 시 최근 EQUITY_MAX_LINES 줄만 남긴다 (다른 프로세스가 덧붙인 줄도 파일에서 다시 세어 반영)
         with open(svc.equity_path, "a", encoding="utf-8") as f:
             for i in range(web_service.EQUITY_TRIM_AT - 2):
                 f.write(
-                    json.dumps({"t": (t0 + timedelta(minutes=10 + i)).isoformat(), "equity": float(i)}) + "\n"
+                    json.dumps({"t": (t0 + timedelta(seconds=120 + i)).isoformat(), "equity": float(i)})
+                    + "\n"
                 )
         assert svc.sample_equity(999.0, t0 + timedelta(days=1)) is True
         n = sum(1 for _ in open(svc.equity_path, encoding="utf-8"))
@@ -710,6 +1020,25 @@ class TestEquity:
         assert svc2.sample_equity(5.0, t0 + timedelta(days=1, seconds=30)) is False
         svc.close()
         svc2.close()
+
+    def test_two_processes_share_the_sixty_second_rule(self, tmp_path: Path, feed_factory: Any) -> None:
+        """같은 디렉터리를 보는 두 대시보드(프로세스) 가 번갈아 샘플해도 60초에 1점을 넘지 않는다."""
+        cfg = make_config(tmp_path)
+        a = DashboardService(cfg)
+        b = DashboardService(cfg)
+        t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        try:
+            assert a.sample_equity(100.0, t0) is True
+            assert b.sample_equity(101.0, t0 + timedelta(seconds=30)) is False  # a 가 쓴 줄을 파일에서 읽는다
+            assert b.sample_equity(102.0, t0 + timedelta(seconds=61)) is True
+            assert a.sample_equity(103.0, t0 + timedelta(seconds=90)) is False  # b 가 쓴 줄을 반영
+            assert a.sample_equity(104.0, t0 + timedelta(seconds=125)) is True
+            lines = a.equity_path.read_text(encoding="utf-8").splitlines()
+            assert [json.loads(ln)["equity"] for ln in lines] == [100.0, 102.0, 104.0]
+            assert a._equity_lines == 3 and b._equity_lines == 2
+        finally:
+            a.close()
+            b.close()
 
 
 # ============================================================================ 로그
@@ -729,7 +1058,7 @@ class TestLogs:
         r = client.get("/api/logs?lines=5")
         assert r.status_code == 200
         body = r.json()
-        assert body["file"] == str(log)
+        assert body["file"] == log.name
         out = body["lines"]
         assert len(out) == 5
         joined = "\n".join(out)
@@ -744,11 +1073,11 @@ class TestLogs:
 
     def test_missing_log_file(self, client: TestClient, config: AppConfig) -> None:
         body = client.get("/api/logs").json()
-        assert body["file"] == config.logging.file and body["lines"] == []
+        assert body["file"] == Path(config.logging.file).name and body["lines"] == []
 
     def test_no_log_file_configured(self, tmp_path: Path, feed_factory: Any) -> None:
         cfg = make_config(tmp_path, logging={"file": None})
-        with TestClient(create_app(cfg)) as c:
+        with make_client(create_app(cfg)) as c:
             body = c.get("/api/logs").json()
             assert body["file"] is None and body["lines"] == []
 
@@ -766,6 +1095,30 @@ class TestLogs:
         # 숫자만/문자만 긴 문자열은 토큰으로 보지 않는다
         assert mask_log_line("x" * 40) == "x" * 40 and mask_log_line("1" * 40) == "1" * 40
         assert mask_log_line("a1" * 20) == "***"
+        # JSON / dict repr / 짧은 키 / 계좌번호 (리뷰 지적 형태 — 값은 모두 가짜 예시)
+        assert (
+            mask_log_line('creds={"upbit_access_key": "AbCdEf12", "upbit_secret_key": "ZyXwVu09"}')
+            == 'creds={"upbit_access_key": "***", "upbit_secret_key": "***"}'
+        )
+        assert (
+            mask_log_line("creds={'ccxt_api_key': 'Qq1Ww2Ee', 'ccxt_password': 'pass1234'}")
+            == "creds={'ccxt_api_key': '***', 'ccxt_password': '***'}"
+        )
+        assert mask_log_line("kis_account_no=12345678-01 조회") == "kis_account_no=*** 조회"
+        assert mask_log_line("alpaca key id PKABCDEFGHIJ12345678 사용") == "alpaca key id *** 사용"
+
+    def test_env_credentials_are_registered_for_masking(
+        self, tmp_path: Path, feed_factory: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """브로커 어댑터는 키를 등록하지 않으므로 대시보드가 .env 자격증명을 직접 등록한다 (형식과 무관하게 가린다)."""
+        secret = "pw#Zq9-7Qx"  # 정규식 규칙(키 이름/길이) 으로는 잡히지 않는 형태
+        monkeypatch.setenv("CCXT_PASSWORD", secret)
+        assert mask_log_line(f"값: {secret} 사용") == f"값: {secret} 사용"
+        svc = DashboardService(make_config(tmp_path))
+        try:
+            assert mask_log_line(f"값: {secret} 사용") == "값: *** 사용"
+        finally:
+            svc.close()
 
     def test_tail_lines(self, tmp_path: Path) -> None:
         p = tmp_path / "t.log"
@@ -797,7 +1150,9 @@ class TestBacktest:
         "interval",
     }
 
-    def test_job_done_from_csv(self, client: TestClient, config: AppConfig, daily_df: pd.DataFrame) -> None:
+    def test_job_done_from_csv(
+        self, client: TestClient, config: AppConfig, daily_df: pd.DataFrame, tmp_path: Path
+    ) -> None:
         store = CandleStore(config.backtest.data_dir)
         store.save("upbit", BTC, "1d", daily_df)
         r = client.post(
@@ -831,7 +1186,8 @@ class TestBacktest:
         assert res["end"] == daily_df["timestamp"].iloc[-1].isoformat()
         for t in res["trades"]:
             assert TestMarketData.TRADE_KEYS <= set(t)
-        assert BTC in res["sources"] and res["sources"][BTC].startswith("csv")
+        assert res["sources"][BTC] == "csv (upbit/KRW-BTC_1d.csv)"
+        assert str(tmp_path) not in json.dumps(body)
         # 목록
         jobs = client.get("/api/backtest").json()["jobs"]
         assert jobs[0]["job_id"] == job_id and jobs[0]["status"] == "done"
@@ -855,7 +1211,7 @@ class TestBacktest:
         assert body["status"] == "done", body
         res = body["result"]
         assert res["strategy"] == "rsi" and res["initial_cash"] == 5_000_000
-        assert res["sources"][BTC].startswith("upbit API")
+        assert res["sources"][BTC] == "upbit API → upbit/KRW-BTC_1d.csv"
         assert len(res["equity"]) == len(complete_candles(daily_candles, "1d"))
         assert any(f.calls["get_candles"] for f in feed_factory())
         # 캐시 CSV 가 만들어졌다
@@ -870,7 +1226,7 @@ class TestBacktest:
         jobs = client.get("/api/backtest").json()["jobs"]
         assert jobs[0]["status"] == "error" and jobs[0]["error"] == body["error"]
 
-    def test_job_error_on_bad_params_and_missing_data(self, client: TestClient) -> None:
+    def test_job_error_on_bad_params_and_missing_data(self, client: TestClient, tmp_path: Path) -> None:
         r = client.post(
             "/api/backtest", json={"strategy": "sma_cross", "params": {"nope": 1}, "source": "csv"}
         )
@@ -879,6 +1235,8 @@ class TestBacktest:
         r = client.post("/api/backtest", json={"source": "csv"})  # 저장된 CSV 없음 → 데이터 오류
         body = poll_job(client, r.json()["job_id"])
         assert body["status"] == "error" and "저장된 데이터가 없습니다" in body["error"]
+        assert str(tmp_path) not in body["error"]  # 절대 경로는 응답에 넣지 않는다
+        assert "upbit/KRW-BTC_1h.csv" in body["error"]
 
     @pytest.mark.parametrize(
         "body",
@@ -887,9 +1245,14 @@ class TestBacktest:
             {"symbols": [1, 2]},
             {"strategy": ""},
             {"params": [1]},
+            {"params": {"nested": {"a": 1}}},
+            {"params": {"long": "x" * 201}},
+            {"params": {"many": list(range(33))}},
+            {"params": {f"k{i}": i for i in range(65)}},
             {"interval": "2h"},
             {"start": "2025/01/01"},
             {"start": 20250101},
+            {"interval": "1m", "start": "2000-01-01"},
             {"initial_cash": -1},
             {"initial_cash": "abc"},
             {"source": "magic"},
@@ -903,6 +1266,16 @@ class TestBacktest:
         assert r.json()["error"]
         assert client.get("/api/backtest").json()["jobs"] == []
 
+    def test_lookback_cap(self, client: TestClient) -> None:
+        r = client.post("/api/backtest", json={"interval": "1m", "start": "2000-01-01", "source": "broker"})
+        assert r.status_code == 400 and "너무 오래전" in r.json()["error"]
+        # 1d 캔들 100,000개는 273년 → 2000-01-01 도 허용 (구조 검사만; 데이터가 없으면 작업 오류)
+        r = client.post("/api/backtest", json={"interval": "1d", "start": "2000-01-01", "source": "csv"})
+        assert r.status_code == 202
+        poll_job(client, r.json()["job_id"])
+        floor = web_jobs.min_start_for("1m")
+        assert timedelta(days=69) < utcnow() - floor < timedelta(days=70)
+
     def test_submit_malformed_json(self, client: TestClient) -> None:
         r = client.post("/api/backtest", content=b"{not json", headers={"content-type": "application/json"})
         assert r.status_code == 400 and "JSON" in r.json()["error"]
@@ -915,13 +1288,59 @@ class TestBacktest:
         ids = []
         for _ in range(23):
             r = client.post("/api/backtest", json={"strategy": "nope", "source": "csv"})
+            assert r.status_code == 202, r.text
             ids.append(r.json()["job_id"])
-        for job_id in ids[-3:]:
-            poll_job(client, job_id)
+            poll_job(client, ids[-1])  # 대기 상한(5개) 에 걸리지 않게 하나씩 끝낸다
         jobs = client.get("/api/backtest").json()["jobs"]
         assert len(jobs) == 20
         assert [j["job_id"] for j in jobs][:3] == ids[-1:-4:-1]
         assert client.get(f"/api/backtest/{ids[0]}").status_code == 404
+
+    def test_pending_cap_returns_429(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        """대기/실행 중 작업이 MAX_PENDING_JOBS 개면 429 — 큐가 무한히 쌓이지 않는다."""
+        gate = threading.Event()
+        started = threading.Event()
+        service: DashboardService = client.app.state.service
+        original = BacktestJobRunner._execute
+
+        def blocked(self: BacktestJobRunner, job: Any) -> dict[str, Any]:
+            started.set()
+            assert gate.wait(30), "테스트가 gate 를 열지 않았습니다"
+            return original(self, job)
+
+        monkeypatch.setattr(BacktestJobRunner, "_execute", blocked)
+        try:
+            ids = []
+            for _ in range(web_jobs.MAX_PENDING_JOBS):
+                r = client.post("/api/backtest", json={"strategy": "nope", "source": "csv"})
+                assert r.status_code == 202, r.text
+                ids.append(r.json()["job_id"])
+            assert started.wait(10)
+            r = client.post("/api/backtest", json={"strategy": "nope", "source": "csv"})
+            assert r.status_code == 429 and "너무 많습니다" in r.json()["error"]
+            assert len(client.get("/api/backtest").json()["jobs"]) == web_jobs.MAX_PENDING_JOBS
+            assert service.jobs.pending_count() == web_jobs.MAX_PENDING_JOBS
+        finally:
+            gate.set()
+        for job_id in ids:
+            assert poll_job(client, job_id)["status"] == "error"
+        assert client.post("/api/backtest", json={"strategy": "nope", "source": "csv"}).status_code == 202
+
+    def test_evicted_jobs_are_cancelled_and_skipped(self, tmp_path: Path, feed_factory: Any) -> None:
+        """목록에서 밀려난 작업은 취소되어 워커가 실행하지 않는다 (아무도 읽을 수 없는 결과를 만들지 않는다)."""
+        cfg = make_config(tmp_path)
+        runner = BacktestJobRunner(
+            cfg, broker_factory=web_service.make_data_broker, max_jobs=2, max_pending=100
+        )
+        runner._ensure_worker = lambda: None  # type: ignore[method-assign] - 워커를 띄우지 않고 큐만 채운다
+        jobs = [runner.submit({"strategy": "nope", "source": "csv"}) for _ in range(5)]
+        assert runner.get(jobs[0].job_id) is None and jobs[0].cancelled is True
+        assert not jobs[-1].cancelled and runner.get(jobs[-1].job_id) is jobs[-1]
+        runner._queue.put(None)
+        runner._worker_loop()  # 큐를 직접 비운다: 취소된 작업은 건너뛰고 나머지는 실행(빠른 실패)
+        assert jobs[0].status == "queued" and jobs[0].started_at is None
+        assert all(j.status == "error" for j in jobs if not j.cancelled)
+        runner.close()
 
 
 # ============================================================================ CLI / 유틸
@@ -960,13 +1379,14 @@ class TestCli:
                 {
                     "symbols": [BTC],
                     "engine": {"state_file": str(tmp_path / "state.json")},
-                    "logging": {"file": None},
+                    "logging": {"file": str(tmp_path / "logs" / "bot.log")},
                     "backtest": {"data_dir": str(tmp_path / "c")},
                 }
             ),
             encoding="utf-8",
         )
         runs: list[dict[str, Any]] = []
+        logging_calls: list[Any] = []
 
         class FakeUvicorn:
             @staticmethod
@@ -974,15 +1394,25 @@ class TestCli:
                 runs.append({"app": app, **kw})
 
         monkeypatch.setitem(sys.modules, "uvicorn", FakeUvicorn)
-        monkeypatch.setattr("tradingbot.web.cli.setup_logging", lambda *a, **k: None)
+        monkeypatch.setattr("tradingbot.web.cli.setup_logging", lambda cfg, **k: logging_calls.append(cfg))
         with caplog.at_level("WARNING"):
             web_cli.web(config_path=cfg_path, host="0.0.0.0", port=8123, no_open=True)
         assert runs and runs[0]["host"] == "0.0.0.0" and runs[0]["port"] == 8123
         assert runs[0]["log_config"] is None
         assert any("인증" in rec.getMessage() for rec in caplog.records)
-        runs[0]["app"].state.service.close()
+        # 대시보드 프로세스는 콘솔 로그만 (외부 엔진의 회전 로그 파일에 두 번째 핸들러를 붙이지 않는다);
+        # 파일 핸들러는 이 프로세스가 엔진을 돌릴 때만 (engine_log_file)
+        assert logging_calls and logging_calls[0].file is None
+        service: DashboardService = runs[0]["app"].state.service
+        assert service.engine_log_file is True
+        service.close()
         caplog.clear()
         with caplog.at_level("WARNING"):
             web_cli.web(config_path=cfg_path, host="127.0.0.1", port=8124, no_open=True)
         assert not any("인증" in rec.getMessage() for rec in caplog.records)
+        # 바인드 주소가 Host 검사에 전달된다: 0.0.0.0 바인드는 LAN IP 허용, 루프백 바인드는 거부
+        with make_client(runs[0]["app"]) as c:
+            assert c.get("/api/health", headers={"Host": "192.168.0.5:8123"}).status_code == 200
+        with make_client(runs[1]["app"]) as c:
+            assert c.get("/api/health", headers={"Host": "192.168.0.5:8124"}).status_code == 400
         runs[1]["app"].state.service.close()

@@ -7,6 +7,8 @@
   <meta name="referrer" content="no-referrer">
   <meta name="color-scheme" content="light dark">
   <meta name="description" content="tradingbot 자동매매 봇 상태·백테스트·거래내역을 보는 로컬 대시보드">
+  <!-- 서버가 프로세스마다 새 토큰으로 치환한다. 상태 변경(POST) 요청의 X-Dashboard-Token 헤더에 실린다 (CSRF 방지). -->
+  <meta name="dashboard-token" content="__DASHBOARD_TOKEN__">
   <title>트레이딩 대시보드</title>
   <link rel="stylesheet" href="/static/style.css">
   <!-- 차트 라이브러리(Lightweight Charts 4.2.0, SRI 고정)는 app.js 가 비동기로 주입한다: CDN 이 느리거나 막혀도 대시보드 데이터는 바로 뜬다 -->

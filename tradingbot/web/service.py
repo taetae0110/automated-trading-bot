@@ -463,7 +463,9 @@ class DashboardService:
                         fetched[sym] = self._valid_price(sym, raw[sym])
                 batch_ok = True
             except Exception as e:  # noqa: BLE001 - 일괄 조회 실패 → 심볼별로 재시도
-                logger.warning("현재가 일괄 조회 실패 (%s), 심볼별로 다시 시도: %s", ", ".join(pending), _err(e))
+                logger.warning(
+                    "현재가 일괄 조회 실패 (%s), 심볼별로 다시 시도: %s", ", ".join(pending), _err(e)
+                )
         for sym in pending:
             if sym in fetched:
                 continue

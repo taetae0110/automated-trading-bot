@@ -1525,6 +1525,15 @@ def _num(value: Any) -> float | None:
         return None
 
 
+# ============================================================================ 웹 대시보드
+# tradingbot/web/cli.py 는 이 모듈을 import 하지 않으므로 순환 참조가 없다.
+from tradingbot.web.cli import web as _web_command  # noqa: E402
+
+app.command("web", help="로컬 웹 대시보드 (상태/포지션/차트/백테스트). 기본 http://127.0.0.1:8080")(
+    _web_command
+)
+
+
 # ============================================================================ 진입점
 def main() -> None:
     """콘솔 스크립트 / ``python -m tradingbot`` 진입점."""

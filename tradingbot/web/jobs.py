@@ -2,47 +2,39 @@
 
 - 데이터 해석은 ``tradingbot.cli.backtest`` 와 같다: ``auto`` 는 저장된 CSV 가 구간을 덮으면 csv, 아니면 브로커 공개 API
   (키 없는 주식 브로커는 yfinance). 데이터를 만들어 내지 않는다 — 없으면 실제 거래소/yfinance 에서 내려받아 캐시한다.
+  CLI 의 데이터 해석 헬퍼는 **작업 실행 시점에** 느리게 import 한다 — ``tradingbot.cli`` (typer 앱 모듈) 가 바뀌어도
+  대시보드 자체는 뜨고, 영향은 백테스트 작업의 오류 보고에만 머문다.
 - 작업은 최근 ``MAX_JOBS`` 개만 메모리에 남긴다. 결과는 JSON 직렬화 가능한 dict (``equity`` 는 최대 ``MAX_EQUITY_POINTS`` 점).
 - 잘못된 전략/파라미터/구간은 작업의 ``status="error"`` + 한국어 ``error`` 로 보고한다 (요청 본문 구조 오류만 400).
+- 상한: 동시에 대기/실행 중인 작업 ``MAX_PENDING_JOBS`` 개 (초과 시 429), 캔들 ``MAX_BARS`` 개(조회 시작일 하한),
+  ``params`` 크기. 목록에서 밀려난 작업은 취소되어 워커가 건너뛴다 (아무도 읽을 수 없는 결과를 만들지 않는다).
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import queue
 import threading
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from tradingbot.backtest import Backtester, BacktestResult, format_metrics
 from tradingbot.brokers.base import BaseBroker
-from tradingbot.cli import (
-    BROKER_INFO,
-    Source,
-    _asset_class_for,
-    _broker_has_credentials,
-    _csv_coverage,
-    _data_broker_name,
-    _default_start,
-    _load_csv,
-    _load_yfinance_to_store,
-    _quiet_backtest_logs,
-    _quote_currency_for,
-    _require_data_credentials,
-    _stock_round_quantity,
-    resolve_config,
-)
 from tradingbot.config import AppConfig
 from tradingbot.data import CandleStore, to_utc_datetime
 from tradingbot.engine.state import dt_to_iso, serialize_trade, to_jsonable
 from tradingbot.exceptions import DataError, TradingBotError
-from tradingbot.models import INTERVAL_SECONDS, AssetClass, ensure_utc, utcnow
+from tradingbot.models import INTERVAL_SECONDS, AssetClass, ensure_utc, interval_to_seconds, utcnow
 from tradingbot.notify import mask_secrets
 from tradingbot.risk import RiskManager
 from tradingbot.strategies import create_strategy
@@ -50,26 +42,50 @@ from tradingbot.strategies import create_strategy
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "MAX_BARS",
     "MAX_EQUITY_POINTS",
     "MAX_JOBS",
+    "MAX_PENDING_JOBS",
+    "SOURCES",
     "BacktestJob",
     "BacktestJobRunner",
+    "JobQueueFullError",
     "JobRequestError",
+    "min_start_for",
     "result_to_dict",
 ]
 
 #: 메모리에 남기는 최근 작업 수
 MAX_JOBS = 20
+#: 동시에 대기/실행 중일 수 있는 작업 수 (초과 시 429)
+MAX_PENDING_JOBS = 5
 #: 응답에 담는 자산곡선 최대 점 수 (초과 시 균등 샘플링, 마지막 점은 유지)
 MAX_EQUITY_POINTS = 5000
 #: 하나의 작업이 다룰 수 있는 최대 심볼 수
 MAX_SYMBOLS = 20
+#: 한 심볼이 다룰 수 있는 최대 캔들 수 — 조회 시작일 하한 (``now - MAX_BARS × interval``) 과 다운로드 중단 기준
+MAX_BARS = 100_000
+#: 다운로드 중단 여유 (페이지 하나 분량)
+_BARS_SLACK = 400
+#: ``params`` 상한 (JSON 직렬화 크기, 키 수, 문자열 길이, 배열 길이)
+MAX_PARAMS_BYTES = 8 * 1024
+MAX_PARAM_KEYS = 64
+MAX_PARAM_STR = 200
+MAX_PARAM_LIST = 32
+#: 백테스트 데이터 출처 (``tradingbot.cli.Source`` 와 같은 값)
+SOURCES: tuple[str, ...] = ("auto", "csv", "broker", "yfinance")
+#: 백테스트 동안 bar 단위 INFO 로그를 WARNING 으로 올릴 로거 (``cli.BACKTEST_QUIET_LOGGERS`` 와 같은 목록)
+_QUIET_LOGGERS: tuple[str, ...] = ("tradingbot.risk.manager", "tradingbot.brokers.paper")
 
 JobStatus = str  # "queued" | "running" | "done" | "error"
 
 
 class JobRequestError(TradingBotError):
     """요청 본문 구조 오류 (HTTP 400)."""
+
+
+class JobQueueFullError(TradingBotError):
+    """대기/실행 중인 작업이 너무 많다 (HTTP 429)."""
 
 
 def _num(value: Any) -> float | None:
@@ -141,6 +157,72 @@ def result_to_dict(result: BacktestResult, sources: Mapping[str, str] | None = N
     }
 
 
+# ============================================================================ 상한 / 헬퍼
+def min_start_for(interval: str, now: datetime | None = None) -> datetime:
+    """이 interval 로 백테스트할 수 있는 가장 이른 시작 시각 (``now - MAX_BARS × interval``)."""
+    base = ensure_utc(now) if now is not None else utcnow()
+    return base - timedelta(seconds=interval_to_seconds(interval) * MAX_BARS)
+
+
+def _lookback_message(interval: str) -> str:
+    days = interval_to_seconds(interval) * MAX_BARS / 86400.0
+    return (
+        f"start 가 너무 오래전입니다: {interval} 캔들은 최근 {MAX_BARS:,}개(약 {days:,.0f}일) 까지만 "
+        "백테스트할 수 있습니다. interval 을 늘리거나 start 를 뒤로 옮기세요"
+    )
+
+
+@contextmanager
+def _quiet_backtest_logs() -> Iterator[None]:
+    """백테스트 동안 bar 단위 INFO 로그를 WARNING 으로 올린다 (수천 줄 방지). ``cli._quiet_backtest_logs`` 와 같은 규칙."""
+    saved = {name: logging.getLogger(name).level for name in _QUIET_LOGGERS}
+    for name in _QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+    try:
+        yield
+    finally:
+        for name, level in saved.items():
+            logging.getLogger(name).setLevel(level)
+
+
+def _cli_helpers() -> Any:
+    """``tradingbot.cli`` 의 데이터 해석 헬퍼 (느린 import). 실패하면 작업 오류로 보고한다."""
+    try:
+        from tradingbot import cli
+    except Exception as e:  # noqa: BLE001 - typer 앱 모듈 import 실패도 작업 오류로
+        raise DataError(
+            f"백테스트 데이터 해석 모듈(tradingbot.cli)을 불러올 수 없습니다: {type(e).__name__}: {e}"
+        ) from e
+    return cli
+
+
+def _is_scalar(value: Any) -> bool:
+    if value is None or isinstance(value, (bool, int, float)):
+        return True
+    return isinstance(value, str) and len(value) <= MAX_PARAM_STR
+
+
+def _check_params(params: Mapping[Any, Any]) -> dict[str, Any]:
+    if len(params) > MAX_PARAM_KEYS:
+        raise JobRequestError(f"params 는 최대 {MAX_PARAM_KEYS}개 키까지 지정할 수 있습니다")
+    out: dict[str, Any] = {}
+    for k, v in params.items():
+        key = str(k)
+        if not key or len(key) > 64:
+            raise JobRequestError("params 키는 1~64자여야 합니다")
+        ok = _is_scalar(v) or (
+            isinstance(v, list) and len(v) <= MAX_PARAM_LIST and all(_is_scalar(x) for x in v)
+        )
+        if not ok:
+            raise JobRequestError(
+                f"params.{key} 값은 숫자/문자열({MAX_PARAM_STR}자 이하)/불리언 또는 그 배열({MAX_PARAM_LIST}개 이하)이어야 합니다"
+            )
+        out[key] = v
+    if len(json.dumps(out, ensure_ascii=False)) > MAX_PARAMS_BYTES:
+        raise JobRequestError(f"params 가 너무 큽니다 (최대 {MAX_PARAMS_BYTES // 1024} KiB)")
+    return out
+
+
 # ============================================================================ 작업
 @dataclass
 class BacktestJob:
@@ -156,7 +238,17 @@ class BacktestJob:
     result: dict[str, Any] | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    #: 목록에서 밀려나(또는 서버 종료로) 결과를 아무도 읽을 수 없게 된 작업 — 워커가 건너뛰고 다운로드도 중단한다
+    cancelled: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def active(self) -> bool:
+        return self.status in ("queued", "running") and not self.cancelled
+
+    def cancel(self) -> None:
+        with self._lock:
+            self.cancelled = True
 
     def set_progress(self, text: str) -> None:
         with self._lock:
@@ -194,7 +286,7 @@ class BacktestJob:
 
 
 def _parse_request(config: AppConfig, body: Any) -> dict[str, Any]:
-    """요청 본문 구조 검사 (타입만). 의미 검증(전략 존재 여부 등)은 작업 실행 시 한다."""
+    """요청 본문 구조 검사 (타입/상한). 의미 검증(전략 존재 여부 등)은 작업 실행 시 한다."""
     if body is None:
         body = {}
     if not isinstance(body, Mapping):
@@ -222,7 +314,7 @@ def _parse_request(config: AppConfig, body: Any) -> dict[str, Any]:
     if params is not None:
         if not isinstance(params, Mapping):
             raise JobRequestError("params 는 객체({key: value})여야 합니다")
-        req["params"] = {str(k): v for k, v in params.items()}
+        req["params"] = _check_params(params)
 
     interval = body.get("interval")
     if interval is not None:
@@ -242,9 +334,17 @@ def _parse_request(config: AppConfig, body: Any) -> dict[str, Any]:
             value = value.strip()
             if value:
                 try:
-                    to_utc_datetime(value, name=key)
+                    parsed = to_utc_datetime(value, name=key)
                 except DataError as e:
                     raise JobRequestError(str(e)) from e
+                if key == "start" and parsed is not None:
+                    effective_interval = req.get("interval") or config.interval
+                    try:
+                        floor = min_start_for(effective_interval)
+                    except ValueError:
+                        floor = None
+                    if floor is not None and parsed < floor:
+                        raise JobRequestError(_lookback_message(effective_interval))
                 req[key] = value
 
     cash = body.get("initial_cash")
@@ -255,8 +355,8 @@ def _parse_request(config: AppConfig, body: Any) -> dict[str, Any]:
         req["initial_cash"] = value
 
     source = body.get("source") or "auto"
-    if not isinstance(source, str) or source not in {s.value for s in Source}:
-        raise JobRequestError(f"source 는 {', '.join(s.value for s in Source)} 중 하나여야 합니다")
+    if not isinstance(source, str) or source not in SOURCES:
+        raise JobRequestError(f"source 는 {', '.join(SOURCES)} 중 하나여야 합니다")
     req["source"] = source
 
     fill_on = body.get("fill_on")
@@ -282,11 +382,13 @@ class BacktestJobRunner:
         *,
         broker_factory: Callable[[AppConfig], BaseBroker],
         max_jobs: int = MAX_JOBS,
+        max_pending: int = MAX_PENDING_JOBS,
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
         self.config = config
         self._broker_factory = broker_factory
         self._max_jobs = max(1, int(max_jobs))
+        self._max_pending = max(1, int(max_pending))
         self._clock = clock
         self._lock = threading.Lock()
         self._jobs: OrderedDict[str, BacktestJob] = OrderedDict()
@@ -308,12 +410,19 @@ class BacktestJobRunner:
         with self._lock:
             if self._closed:
                 raise JobRequestError("서버가 종료 중이라 작업을 받을 수 없습니다")
+            pending = sum(1 for j in self._jobs.values() if j.active)
+            if pending >= self._max_pending:
+                raise JobQueueFullError(
+                    f"대기 중인 백테스트가 너무 많습니다 (대기/실행 {pending}개, 최대 {self._max_pending}개). "
+                    "진행 중인 작업이 끝난 뒤 다시 시도하세요"
+                )
             self._jobs[job.job_id] = job
             while len(self._jobs) > self._max_jobs:
                 old_id, old = next(iter(self._jobs.items()))
-                if old.status in ("queued", "running") and len(self._jobs) <= self._max_jobs * 2:
+                if old.active and len(self._jobs) <= self._max_jobs * 2:
                     break
                 self._jobs.pop(old_id)
+                old.cancel()  # 아무도 읽을 수 없는 결과는 만들지 않는다
             self._ensure_worker()
         self._queue.put(job)
         return job
@@ -327,10 +436,18 @@ class BacktestJobRunner:
             jobs = list(self._jobs.values())
         return [j.summary() for j in reversed(jobs)]
 
+    def pending_count(self) -> int:
+        with self._lock:
+            return sum(1 for j in self._jobs.values() if j.active)
+
     def close(self) -> None:
         with self._lock:
             self._closed = True
             worker = self._worker
+            jobs = list(self._jobs.values())
+        for j in jobs:
+            if j.active:
+                j.cancel()
         if worker is not None and worker.is_alive():
             self._queue.put(None)
 
@@ -347,6 +464,9 @@ class BacktestJobRunner:
             job = self._queue.get()
             if job is None:
                 return
+            if job.cancelled:
+                logger.debug("백테스트 작업 %s 는 취소되어 건너뜁니다", job.job_id)
+                continue
             self._run(job)
 
     def _run(self, job: BacktestJob) -> None:
@@ -357,10 +477,10 @@ class BacktestJobRunner:
         try:
             result = self._execute(job)
         except TradingBotError as e:
-            self._fail(job, mask_secrets(str(e)) or type(e).__name__)
+            self._fail(job, self._strip_paths(mask_secrets(str(e)) or type(e).__name__))
         except Exception as e:  # noqa: BLE001 - 워커가 죽지 않게 모든 오류를 작업 실패로
             logger.exception("백테스트 작업 %s 실패", job.job_id)
-            self._fail(job, f"{type(e).__name__}: {mask_secrets(str(e))}")
+            self._fail(job, self._strip_paths(f"{type(e).__name__}: {mask_secrets(str(e))}"))
         else:
             with job._lock:
                 job.result = result
@@ -381,12 +501,28 @@ class BacktestJobRunner:
             job.error = message
             job.progress = None
             job.finished_at = ensure_utc(self._clock())
-        logger.warning("백테스트 작업 %s 오류: %s", job.job_id, message)
+        if job.cancelled:
+            logger.debug("취소된 백테스트 작업 %s 종료: %s", job.job_id, message)
+        else:
+            logger.warning("백테스트 작업 %s 오류: %s", job.job_id, message)
+
+    def _strip_paths(self, text: str) -> str:
+        """오류 메시지의 데이터 디렉터리 절대 경로를 지운다 (응답에 파일시스템 경로를 넣지 않는다)."""
+        root = Path(self.config.backtest.data_dir)
+        candidates: list[str] = []
+        for p in (root.resolve(), root.absolute(), root):
+            s = str(p)
+            if s and s not in (".", os.sep) and s not in candidates:
+                candidates.append(s)
+        for s in sorted(candidates, key=len, reverse=True):
+            text = text.replace(s + os.sep, "").replace(s, "")
+        return text
 
     # ------------------------------------------------------------------ 실행
     def _execute(self, job: BacktestJob) -> dict[str, Any]:
+        cli = _cli_helpers()
         req = job.request
-        config = resolve_config(
+        config = cli.resolve_config(
             self.config,
             symbols=req.get("symbols"),
             interval=req.get("interval"),
@@ -402,19 +538,21 @@ class BacktestJobRunner:
             job.symbols = list(config.symbols)
             job.interval = config.interval
         strategy = create_strategy(config.strategy.name, config.strategy.params)
-        broker_name = _data_broker_name(config)
+        broker_name = cli._data_broker_name(config)
         start_dt = to_utc_datetime(config.backtest.start, name="start")
         end_dt = to_utc_datetime(config.backtest.end, name="end")
         if start_dt is not None and end_dt is not None and start_dt > end_dt:
             raise DataError(f"start({config.backtest.start}) 가 end({config.backtest.end}) 보다 늦습니다")
+        if start_dt is not None and start_dt < min_start_for(config.interval):
+            raise DataError(_lookback_message(config.interval))
 
         store = CandleStore(config.backtest.data_dir)
         data, sources = self._load_data(
-            job, config, store, Source(req.get("source") or "auto"), start_dt, end_dt
+            job, cli, config, store, str(req.get("source") or "auto"), start_dt, end_dt
         )
 
-        asset_class = _asset_class_for(broker_name)
-        quote = _quote_currency_for(config.symbols[0], broker_name, config)
+        asset_class = cli._asset_class_for(broker_name)
+        quote = cli._quote_currency_for(config.symbols[0], broker_name, config)
         bt = Backtester(
             strategy,
             RiskManager(config.risk),
@@ -426,8 +564,10 @@ class BacktestJobRunner:
             interval=config.interval,
             asset_class=asset_class,
             min_order_value=config.risk.min_order_value,
-            round_quantity=_stock_round_quantity if asset_class == AssetClass.STOCK else None,
+            round_quantity=cli._stock_round_quantity if asset_class == AssetClass.STOCK else None,
         )
+        if job.cancelled:
+            raise DataError("작업이 취소되었습니다")
         job.set_progress("백테스트 실행 중")
         with _quiet_backtest_logs():
             result = bt.run(data)
@@ -436,18 +576,24 @@ class BacktestJobRunner:
     def _load_data(
         self,
         job: BacktestJob,
+        cli: Any,
         config: AppConfig,
         store: CandleStore,
-        source: Source,
+        source: str,
         start: datetime | None,
         end: datetime | None,
     ) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
-        """``cli._load_backtest_data`` 와 같은 규칙. 브로커는 주입된 factory 로 만들고 진행 상황을 작업에 기록한다."""
-        broker_name = _data_broker_name(config)
+        """``cli._load_backtest_data`` 와 같은 규칙. 브로커는 주입된 factory 로 만들고 진행 상황을 작업에 기록한다.
+
+        출처 설명(``sources``)에는 데이터 디렉터리 아래 상대 경로만 넣는다. 다운로드는 ``MAX_BARS`` 를 넘거나 작업이
+        취소되면 진행 콜백에서 중단한다.
+        """
+        broker_name = cli._data_broker_name(config)
         interval = config.interval
         data: dict[str, pd.DataFrame] = {}
         used: dict[str, str] = {}
         broker: BaseBroker | None = None
+        floor = min_start_for(interval)
 
         def get_broker() -> BaseBroker:
             nonlocal broker
@@ -456,31 +602,46 @@ class BacktestJobRunner:
             return broker
 
         def needs_yfinance() -> bool:
-            if not BROKER_INFO.get(broker_name, {}).get("data_needs_keys"):
+            if not cli.BROKER_INFO.get(broker_name, {}).get("data_needs_keys"):
                 return False
-            return _broker_has_credentials(get_broker()) is False
+            return cli._broker_has_credentials(get_broker()) is False
+
+        def download_start() -> datetime:
+            if start is not None:
+                return start
+            default: datetime = cli._default_start(interval)
+            return max(ensure_utc(default), floor)
 
         try:
             for sym in config.symbols:
+                if job.cancelled:
+                    raise DataError("작업이 취소되었습니다")
                 chosen = source
-                if source == Source.auto:
-                    if _csv_coverage(store, broker_name, sym, interval, start, end) is not None:
-                        chosen = Source.csv
+                if source == "auto":
+                    if cli._csv_coverage(store, broker_name, sym, interval, start, end) is not None:
+                        chosen = "csv"
                     elif needs_yfinance():
-                        chosen = Source.yfinance
+                        chosen = "yfinance"
                     else:
-                        chosen = Source.broker
-                if chosen == Source.csv:
+                        chosen = "broker"
+                if chosen == "csv":
                     job.set_progress(f"{sym} 저장된 캔들 읽는 중")
-                    df, where = _load_csv(store, broker_name, sym, interval, start, end)
-                    used[sym] = f"csv ({store.path(where, sym, interval)})"
-                elif chosen == Source.broker:
+                    df, where = cli._load_csv(store, broker_name, sym, interval, start, end)
+                    used[sym] = f"csv ({where}/{store.path(where, sym, interval).name})"
+                elif chosen == "broker":
                     b = get_broker()
-                    _require_data_credentials(b, broker_name)
-                    dl_start = start or _default_start(interval)
+                    cli._require_data_credentials(b, broker_name)
+                    dl_start = download_start()
                     job.set_progress(f"{sym} {interval} 캔들 다운로드 중 ({b.name})")
 
                     def on_page(count: int, oldest: datetime, _sym: str = sym) -> None:
+                        if job.cancelled:
+                            raise DataError("작업이 취소되어 다운로드를 중단합니다")
+                        if count > MAX_BARS + _BARS_SLACK:
+                            raise DataError(
+                                f"{_sym} {interval}: 다운로드 캔들 수가 상한({MAX_BARS:,}개)을 넘어 중단했습니다. "
+                                "start 를 뒤로 옮기거나 interval 을 늘리세요"
+                            )
                         job.set_progress(
                             f"{_sym} {interval} 다운로드: {count:,}개 (가장 오래된 {oldest:%Y-%m-%d %H:%M}Z)"
                         )
@@ -490,11 +651,13 @@ class BacktestJobRunner:
                         raise DataError(
                             f"{b.name} 에서 {sym} {interval} 구간의 캔들을 받지 못했습니다 (심볼/간격/기간을 확인하세요)"
                         )
-                    used[sym] = f"{broker_name} API → {store.path(broker_name, sym, interval)}"
+                    used[sym] = (
+                        f"{broker_name} API → {broker_name}/{store.path(broker_name, sym, interval).name}"
+                    )
                 else:
-                    dl_start = start or _default_start(interval)
+                    dl_start = download_start()
                     job.set_progress(f"{sym} yfinance 다운로드 중")
-                    df, yf_sym = _load_yfinance_to_store(
+                    df, yf_sym = cli._load_yfinance_to_store(
                         store, config, broker_name, sym, interval, dl_start, end
                     )
                     used[sym] = f"yfinance {yf_sym}"
