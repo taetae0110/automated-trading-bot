@@ -24,3 +24,6 @@ kis_token*.json
 .DS_Store
 .idea/
 .vscode/
+
+# 로컬 사용자 설정 (tradingbot init 이 생성)
+config/config.yaml
